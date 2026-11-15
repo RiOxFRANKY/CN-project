@@ -1,0 +1,831 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[a4paper,margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage{tabularx}
+\usepackage{needspace}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\rollno}{002410501045}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{Computer Networks, Project}
+\fancyhead[R]{\rollno}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\captionsetup{font=small}
+\captionsetup[lstlisting]{font=small,skip=4pt}
+\setlist{itemsep=3pt,topsep=4pt}
+
+\lstdefinelanguage{Rust}{
+  morekeywords={as,break,const,continue,else,enum,false,fn,for,if,impl,in,let,loop,
+    match,mod,move,mut,pub,ref,return,self,Self,static,struct,trait,true,type,use,
+    where,while,Some,None,Ok,Err},
+  sensitive=true,
+  morecomment=[l]{//},
+  morestring=[b]",
+}
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\ttfamily,
+  commentstyle=\color{gray}\itshape,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=6pt,
+  frame=single,
+  rulecolor=\color{gray},
+  xleftmargin=1.4em,
+  framexleftmargin=1.4em,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  captionpos=t,
+  aboveskip=8pt,
+  belowskip=8pt,
+}
+\lstdefinestyle{plain}{numbers=none,xleftmargin=0pt,framexleftmargin=0pt,basicstyle=\ttfamily\scriptsize}
+
+\begin{document}
+
+% ---------------------------------------------------------------- title page
+\begin{titlepage}
+  \centering
+  \vspace*{6cm}
+  {\huge Computer Networks\par}
+  \vspace{0.8cm}
+  {\Large Project\par}
+  \vspace{0.5cm}
+  {\large BCSE III\par}
+  \vspace{4cm}
+  {\large Name: Abhirup Sarkar\par}
+  \vspace{0.35cm}
+  {\large Roll: \rollno\par}
+  \vspace{0.35cm}
+  {\large Group: A2\par}
+  \vfill
+\end{titlepage}
+\setcounter{page}{1}
+
+% ---------------------------------------------------------------- 1
+\section{Problem Statement}
+
+Implement two network protocols in Rust, using only the standard library. The
+first is a basic \emph{secure shell}: a server that gives an authenticated
+client a remote shell over an encrypted TCP connection, together with a key
+generator and a file copy tool, in the style of \texttt{ssh},
+\texttt{ssh-keygen} and \texttt{scp}. The second is the \emph{Address
+Resolution Protocol}: a server that keeps an IP $\rightarrow$ MAC table and a
+client that resolves addresses and caches the answers, exchanging packets in
+the RFC~826 format.
+
+% ---------------------------------------------------------------- 2
+\section{Design}
+
+\subsection{What the programs are meant to do}
+
+The repository holds two Cargo projects. \texttt{rsh/} is a workspace of four
+crates and \texttt{arp/} is a single binary.
+
+\textbf{rsh.} The server owns an RSA \emph{host key}. A client owns an
+\emph{identity key}, made with \texttt{rsh-keygen}, whose public half must be
+listed in the server's \texttt{authorized\_keys}. When a client connects, the
+server first sends its host key. The client compares it with
+\texttt{known\_hosts}: a new host is trusted and remembered, a host whose key
+has changed is refused. The client then picks a random 32-byte \emph{session
+key}, encrypts it with the host's public key and sends it, so that only the
+server can read it. From that point both directions are encrypted with a
+stream cipher keyed by the session key. The client proves who it is by signing
+the session key and its user name with its private key.
+
+After the handshake the client asks for one of three services. \texttt{Shell}
+starts \texttt{cmd.exe} or \texttt{sh -i} on the server and streams its input
+and output; \texttt{Upload} and \texttt{Download} move one file, which is how
+\texttt{rcp} works. All keys and host files live in \texttt{\textasciitilde/.rsh/},
+or in \texttt{\$RSH\_HOME}.
+
+\textbf{arp.} Real ARP frames need raw Ethernet access, so the 28-byte ARP
+packets are carried in UDP datagrams instead. The server answers a request for
+an address in its table and, as real ARP does, learns the sender's IP and MAC
+from every request it sees. The client derives its MAC from its IP
+(\texttt{02:00:} followed by the four IP bytes), looks in its cache first, sends
+a request on a miss and caches the reply for 60 seconds.
+
+\subsection{Cryptography}
+
+The RSA key uses two random 32-bit primes $p, q$, which gives a 64-bit modulus:
+\[
+  n = pq, \qquad e = 65537, \qquad ed \equiv 1 \pmod{(p-1)(q-1)}, \qquad
+  c = m^{e} \bmod n, \qquad m = c^{d} \bmod n.
+\]
+Data is cut into 7-byte blocks, so that every block $m < 2^{56} < n$, and each
+block becomes an 8-byte ciphertext. A signature is $s = H(x)^{d} \bmod n$ and is
+checked with $s^{e} \equiv H(x) \pmod n$, where $H$ is a 64-bit digest built
+from FNV-1a. Primes are found with the Miller--Rabin test using the first twelve
+primes as witnesses, which is exact for every 64-bit number. The session cipher
+is a \texttt{xoshiro256}-style generator seeded from the session key and a
+direction label, so that client$\to$server and server$\to$client never share a
+keystream. Figure~\ref{fig:handshake} shows the full exchange.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  msg/.style={-{Stealth[length=2.2mm]},thick},
+  note/.style={font=\footnotesize,align=left,text width=3.3cm},
+]
+  \def\L{0} \def\R{8.6}
+  \node[font=\bfseries] at (\L,0.4) {Client};
+  \node[font=\bfseries] at (\R,0.4) {Server};
+  \draw[gray] (\L,0) -- (\L,-7.6);
+  \draw[gray] (\R,0) -- (\R,-7.6);
+
+  \draw[msg] (\R,-0.6) -- node[above]{\texttt{HostKey}$(n_h, e)$ \quad 21 B, clear} (\L,-1.0);
+  \node[note,anchor=east,align=right] at (\L-0.2,-1.0) {check \texttt{known\_hosts}};
+
+  \draw[msg] (\L,-1.7) -- node[above]{\texttt{SessionKey}$(K^{e} \bmod n_h)$ \quad 53 B} (\R,-2.1);
+  \node[note,anchor=west] at (\R+0.2,-2.1) {$K = $ decrypt with $d_h$};
+
+  \draw[dashed,gray] (\L,-2.7) -- node[fill=white,font=\footnotesize]{stream cipher on: keystreams $(K,\text{c2s})$ and $(K,\text{s2c})$} (\R,-2.7);
+
+  \draw[msg,blue!70!black] (\L,-3.4) -- node[above]{\texttt{Auth}$(\text{user}, n_c, e, \sigma)$ \quad 40 B} (\R,-3.8);
+  \node[note,anchor=east,align=right] at (\L-0.2,-3.4) {$\sigma = H(\text{``rsh-auth''}\Vert K$\\$\Vert\,\text{user})^{d_c}$};
+  \node[note,anchor=west] at (\R+0.2,-3.8) {key in\\ \texttt{authorized\_keys}?\\ $\sigma^{e} \equiv H(\dots)$?};
+
+  \draw[msg,blue!70!black] (\R,-4.6) -- node[above]{\texttt{Success}(``welcome student'') \quad 24 B} (\L,-5.0);
+
+  \draw[msg,blue!70!black] (\L,-5.7) -- node[above]{\texttt{Shell} \;|\; \texttt{Upload} \;|\; \texttt{Download}} (\R,-6.1);
+  \draw[msg,blue!70!black,<->] (\L,-6.8) -- node[above]{\texttt{Data}, \texttt{Eof}, \texttt{Exit}, \texttt{File}, \texttt{Disconnect}} (\R,-7.2);
+\end{tikzpicture}
+\caption{The rsh handshake. Black messages travel in clear, blue ones are encrypted. Sizes are whole TCP frames measured in Section~\ref{sec:wire}.}
+\label{fig:handshake}
+\end{figure}
+
+\subsection{Module structure}
+
+\begin{table}[H]
+\centering
+\footnotesize
+\begin{tabularx}{\textwidth}{@{}>{\ttfamily}l X@{}}
+\toprule
+\normalfont File & Contents \\
+\midrule
+rsh-crypto/src/math.rs      & modular multiply, power, gcd and inverse (128-bit intermediates) \\
+rsh-crypto/src/prime.rs     & Miller--Rabin test and random prime generation \\
+rsh-crypto/src/rsa.rs       & key generation, block encrypt/decrypt, sign/verify, fingerprint \\
+rsh-crypto/src/cipher.rs    & stream cipher for the session \\
+rsh-crypto/src/hash.rs      & FNV-1a based 64-bit digest \\
+rsh-crypto/src/keyfile.rs   & text key file format, load and save \\
+rsh-main/src/packet.rs      & 4-byte length-prefixed framing over TCP (max 64 MiB) \\
+rsh-main/src/codec.rs, message.rs & typed message encoding and checked decoding \\
+rsh-main/src/transport.rs   & encrypted send and receive, split into sender and receiver \\
+rsh-main/src/handshake.rs   & host key, session key and authentication \\
+rsh-main/src/server/        & listener, session loop, shell streaming, \texttt{cmd} echo filter, files \\
+rsh-main/src/client/        & connecting, terminal $\leftrightarrow$ remote shell streaming \\
+rsh-keygen/src/, rcp/src/   & key generator and file copy tool \\
+arp/src/packet.rs           & ARP packet encoding and decoding \\
+arp/src/server.rs, client.rs, cache.rs & UDP server with table, interactive resolver, cache with expiry \\
+\midrule
+rsh-crypto/tests/*.rs       & new: arithmetic, RSA, cipher, key files; factoring attack \\
+rsh-main/tests/protocol.rs  & new: messages, frames, handshakes over TCP through a recording relay \\
+arp/tests/arp.rs            & new: black-box tests of the \texttt{arp} binary with hand-built packets \\
+\bottomrule
+\end{tabularx}
+\caption{Files of the two projects.}
+\end{table}
+
+\subsection{Wire formats}
+
+Every rsh message is one frame: a 4-byte big-endian length, then a 1-byte tag
+and the fields. Integers are big-endian \texttt{u64}; strings and byte arrays
+carry a 4-byte length. Once the cipher is on, everything after the length is
+encrypted.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}r >{\ttfamily}l l l@{}}
+\toprule
+Tag & \normalfont Message & Direction & Fields \\
+\midrule
+1  & HostKey     & server $\to$ client & $n$, $e$ \\
+2  & SessionKey  & client $\to$ server & RSA ciphertext of $K$ \\
+3  & Auth        & client $\to$ server & user, $n$, $e$, signature \\
+4, 5 & Success, Failure & either      & text \\
+6  & Shell       & client $\to$ server & -- \\
+7, 8 & Data, Eof & both                & bytes / -- \\
+9  & Exit        & server $\to$ client & exit code \\
+10 & Upload      & client $\to$ server & remote path, file name, bytes \\
+11, 12 & Download, File & client $\to$ server, back & path / name, bytes \\
+13 & Disconnect  & client $\to$ server & -- \\
+\bottomrule
+\end{tabular}
+\caption{rsh messages.}
+\end{table}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}l l l l@{}}
+\toprule
+Bytes & Field & Value here & Meaning \\
+\midrule
+0--1   & htype & \texttt{00 01} & Ethernet \\
+2--3   & ptype & \texttt{08 00} & IPv4 \\
+4, 5   & hlen, plen & \texttt{06}, \texttt{04} & MAC and IP lengths \\
+6--7   & oper  & \texttt{00 01} / \texttt{00 02} & request / reply \\
+8--13  & sender hardware address & & MAC of the sender \\
+14--17 & sender protocol address & & IP of the sender \\
+18--23 & target hardware address & zero in a request & \\
+24--27 & target protocol address & & IP being asked about \\
+\bottomrule
+\end{tabular}
+\caption{The 28-byte ARP packet (RFC 826), sent as one UDP datagram.}
+\end{table}
+
+\subsection{Build and run}
+
+\begin{lstlisting}[style=plain]
+cd rsh && cargo build --release
+target/release/rsh-keygen -a                      # make id_rsh and authorize it on this machine
+target/release/rsh server [port]                  # default port 2222
+target/release/rsh connect <host> [port]
+target/release/rcp [-P port] <file> <host>:<remote-path>
+target/release/rcp [-P port] <host>:<remote-path> <local-path>
+cargo test --workspace
+
+cd arp && cargo run -- server [port]              # default UDP port 4000
+cargo run -- client [my-ip] [server] [port]       # input: an IPv4 address | cache | quit
+cargo test
+\end{lstlisting}
+
+% ---------------------------------------------------------------- 3
+\section{Implementation}
+
+\subsection{Keys and primes}
+
+\texttt{KeyPair::generate} draws two different 32-bit primes and retries until
+$e$ is invertible modulo $\varphi(n)$. Both primes have their top bit set, so
+$n \geq 2^{62}$ and a 7-byte block always fits.
+
+\Needspace{14\baselineskip}
+\begin{lstlisting}[caption={Key generation in \texttt{KeyPair::generate} (\texttt{rsa.rs}).}]
+loop {
+    let p = random_prime(rng, 32);
+    let q = random_prime(rng, 32);
+    if p == q { continue; }
+    let phi = (p - 1) * (q - 1);
+    let Some(d) = inv_mod(EXPONENT, phi) else { continue; };    // gcd(e, phi) must be 1
+    let n = p * q;
+    return KeyPair { public: PublicKey { n, e: EXPONENT },
+                     private: PrivateKey { n, e: EXPONENT, d } };
+}
+\end{lstlisting}
+
+\Needspace{14\baselineskip}
+\begin{lstlisting}[caption={Miller--Rabin witness loop in \texttt{is\_prime} (\texttt{prime.rs}); $n-1 = 2^{s}d$.}]
+'witness: for &a in &BASES {               // 2, 3, 5, ..., 37
+    let mut x = pow_mod(a, d, n);
+    if x == 1 || x == n - 1 { continue; }
+    for _ in 1..s {
+        x = mul_mod(x, x, n);
+        if x == n - 1 { continue 'witness; }
+    }
+    return false;                           // a proves n composite
+}
+true
+\end{lstlisting}
+
+\subsection{Framing and encryption}
+
+The sender encodes the message, runs it through its cipher and writes one
+frame. The receiver does the reverse. Because the two directions use separate
+\texttt{Sender} and \texttt{Receiver} halves, the shell can read and write at
+the same time from different threads.
+
+\Needspace{19\baselineskip}
+\begin{lstlisting}[caption={Encrypted send and receive (\texttt{transport.rs}) and frame writing (\texttt{packet.rs}).}]
+pub fn send(&mut self, message: &Message) -> io::Result<()> {
+    let mut data = message.encode();
+    if let Some(cipher) = &mut self.cipher { cipher.apply(&mut data); }
+    write_frame(&mut self.stream, &data)
+}
+pub fn recv(&mut self) -> io::Result<Message> {
+    let mut data = read_frame(&mut self.stream)?;
+    if let Some(cipher) = &mut self.cipher { cipher.apply(&mut data); }
+    Message::decode(&data)               // rejects unknown tags, truncation, trailing bytes
+}
+pub fn write_frame(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
+    w.write_all(&(data.len() as u32).to_be_bytes())?;     // first write: 4 bytes
+    w.write_all(data)?;                                    // second write: the body
+    w.flush()
+}
+\end{lstlisting}
+
+\subsection{Server side of the handshake}
+
+\Needspace{14\baselineskip}
+\begin{lstlisting}[caption={\texttt{handshake::server} (\texttt{handshake.rs}), shortened.}]
+t.send(&Message::HostKey(host_key.public()))?;
+let session_key = match t.recv()? {
+    Message::SessionKey(encrypted) => host_key.decrypt(&encrypted)?,
+    _ => return Err(invalid("expected session key")),
+};
+t.encrypt_with(&session_key, Role::Server);           // c2s and s2c keystreams
+let (user, key, signature) = /* expect Message::Auth */;
+if !auth::is_authorized(&key) { /* send Failure, refuse */ }
+if !key.verify(&auth::auth_data(&session_key, &user), signature) { /* refuse */ }
+t.send(&Message::Success(format!("welcome {user}")))?;
+\end{lstlisting}
+
+\subsection{Remote shell}
+
+The server starts one shell per connection with piped standard streams. One
+thread per output stream (\emph{pump}) reads the pipe and sends \texttt{Data};
+the session thread writes incoming \texttt{Data} to the shell's input. A third
+thread waits for the pumps to finish, collects the exit code and sends
+\texttt{Exit}. On Windows, \texttt{cmd.exe} echoes every input line, so the
+\texttt{EchoFilter} removes the echo before it reaches the client.
+
+\Needspace{17\baselineskip}
+\begin{lstlisting}[caption={An output pump (\texttt{server/shell.rs}).}]
+thread::spawn(move || {
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = match source.read(&mut buf) { Ok(0) | Err(_) => break, Ok(n) => n };
+        let data = match &echo {
+            Some(filter) => filter.lock().unwrap().filter(&buf[..n]),
+            None => buf[..n].to_vec(),
+        };
+        if !data.is_empty() && sender.lock().unwrap().send(&Message::Data(data)).is_err() {
+            return;                         // client is gone
+        }
+    }
+})
+\end{lstlisting}
+
+\subsection{ARP server and client}
+
+\Needspace{15\baselineskip}
+\begin{lstlisting}[caption={Learning and answering in the ARP server loop (\texttt{server.rs}).}]
+let request = match ArpPacket::decode(&buf[..n]) {
+    Some(p) if p.op == REQUEST => p,
+    _ => continue,                             // malformed or not a request
+};
+if table.insert(request.sender_ip, request.sender_mac).is_none() {
+    println!("Learned {} is at {}", request.sender_ip, request.sender_mac);
+}
+match table.get(&request.target_ip) {
+    Some(&mac) => { socket.send_to(&request.reply_to(mac).encode(), from)?; }
+    None => println!("No host has {}, request dropped", request.target_ip),
+}
+\end{lstlisting}
+
+The reply swaps the roles: the found MAC becomes the sender hardware address and
+the requester becomes the target. The client keeps a
+\texttt{BTreeMap<Ipv4Addr, (Mac, Instant)>} and drops entries older than 60\,s
+before every lookup; a request that gets no matching reply within 2\,s is
+reported as \texttt{No reply}.
+
+% ---------------------------------------------------------------- 4
+\section{Test Cases}
+
+The projects had no tests, so three test files were added without changing the
+programs. The rsh tests use the library crates directly; the handshake tests run
+on real TCP connections on \texttt{127.0.0.1} through a small relay that keeps a
+copy of every byte. The ARP tests start the real \texttt{arp} binary and talk to
+it with packets built by hand from RFC~826, so they also check the wire format.
+
+\begin{table}[H]
+\centering
+\footnotesize
+\begin{tabularx}{\textwidth}{@{}>{\ttfamily\scriptsize}l X@{}}
+\toprule
+\normalfont Test & Input and expected result \\
+\midrule
+\multicolumn{2}{@{}l}{\textit{rsh-crypto/tests/crypto.rs}} \\
+modular\_arithmetic\_is\_correct & 1000 random moduli: $ab \bmod m$ and $a \cdot a^{-1} \equiv 1$; no inverse when $\gcd \ne 1$ \\
+miller\_rabin\_agrees\_with\_sieve & every $n \le 200\,000$ matches a sieve; Carmichael numbers rejected; $2^{61}-1$ and $2^{64}-59$ prime \\
+keys\_have\_64\_bit\_modulus & 50 keys: $n \ge 2^{62}$, $e = 65537$, $(m^{e})^{d} \equiv m$ \\
+rsa\_encrypt\_decrypt\_round\_trip & lengths 0--99 bytes: round trip, ciphertext is $4 + 8\lceil \ell/7 \rceil$ bytes \\
+wrong\_private\_key\_cannot\_decrypt & another key gives other bytes; a cut ciphertext is an error \\
+signatures\_verify\_and\_detect\_changes & wrong key, one changed data bit or signature bit: rejected \\
+stream\_cipher\_round\_trip\_and\_directions & round trip; the two directions and two keys give different streams \\
+flipped\_ciphertext\_bit\_flips\_plaintext\_bit & flipping wire bits turns \texttt{rm -i} into \texttt{rm -f} without the key \\
+key\_files\_round\_trip & public and private key text formats round-trip; bad lines rejected \\
+fingerprint\_format & 8 colon-separated hex bytes \\
+\multicolumn{2}{@{}l}{\textit{rsh-crypto/tests/attack.rs}} \\
+pollard\_rho\_finds\_factors & 140 moduli of 16--64 bits: a prime factor is found every time \\
+public\_key\_alone\_recovers\_session\_key & 10 real keys: $d$ recovered, session key decrypted, signature forged \\
+factoring\_time\_by\_modulus\_size & timing table for trial division and Pollard's rho (Table~\ref{tab:factor}) \\
+\multicolumn{2}{@{}l}{\textit{rsh-main/tests/protocol.rs}} \\
+every\_message\_round\_trips & all 13 message types encode and decode to the same value \\
+malformed\_messages\_are\_rejected & empty, unknown tag, truncated, trailing byte, bad UTF-8: errors \\
+frames\_round\_trip\_and\_enforce\_limits & two frames read back; length 0 and $> 64$\,MiB refused both ways \\
+handshake\_then\_encrypted\_data & full login over TCP, data both ways; user name and command never on the wire \\
+unknown\_client\_key\_is\_rejected & stranger key: \texttt{PermissionDenied}, ``not in authorized\_keys'' \\
+changed\_host\_key\_is\_refused & same host name, new host key: ``HAS CHANGED'' \\
+recorded\_login\_can\_be\_replayed & the two recorded login frames, sent again by a keyless client, are accepted \\
+\multicolumn{2}{@{}l}{\textit{arp/tests/arp.rs}} \\
+reply\_has\_rfc826\_layout & reply to a hand-built request equals the expected 28 bytes exactly \\
+all\_preloaded\_hosts\_resolve & the four table entries give their MAC addresses \\
+unknown\_host\_gets\_no\_reply & \texttt{192.168.1.99}: no datagram comes back \\
+server\_learns\_the\_sender & unknown before, known after that host sends one request \\
+malformed\_packets\_are\_ignored & wrong htype, ptype, hlen, a reply, 20 bytes, empty: no answer, server still up \\
+any\_request\_can\_overwrite\_an\_entry & a request claiming \texttt{192.168.1.1} replaces the gateway's MAC \\
+client\_uses\_its\_cache & client binary: one request for two lookups, \texttt{Cache hit}, cache table \\
+second\_client\_finds\_the\_first & client B resolves client A's address; bad input reported \\
+udp\_round\_trip\_time & 1000 request/reply round trips timed \\
+\bottomrule
+\end{tabularx}
+\caption{Automated tests (29 in total).}
+\end{table}
+
+\Needspace{20\baselineskip}
+All 29 tests pass (\texttt{cargo test -{}-workspace} in \texttt{rsh/}, \texttt{cargo test} in \texttt{arp/}):
+
+\noindent\begin{minipage}[t]{0.495\textwidth}
+\begin{lstlisting}[style=plain,basicstyle=\ttfamily\fontsize{6.4}{7.8}\selectfont]
+test modular_arithmetic_is_correct ... ok
+test miller_rabin_agrees_with_sieve ... ok
+test keys_have_64_bit_modulus ... ok
+test rsa_encrypt_decrypt_round_trip ... ok
+test wrong_private_key_cannot_decrypt ... ok
+test signatures_verify_and_detect_changes ... ok
+test stream_cipher_round_trip_and_directions ... ok
+test flipped_ciphertext_bit_flips_plaintext_bit ... ok
+test key_files_round_trip ... ok
+test fingerprint_format ... ok
+test result: ok. 10 passed; 0 failed
+test pollard_rho_finds_factors ... ok
+test public_key_alone_recovers_session_key ... ok
+test factoring_time_by_modulus_size ... ok
+test result: ok. 3 passed; 0 failed
+\end{lstlisting}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.495\textwidth}
+\begin{lstlisting}[style=plain,basicstyle=\ttfamily\fontsize{6.4}{7.8}\selectfont]
+test every_message_round_trips ... ok
+test malformed_messages_are_rejected ... ok
+test frames_round_trip_and_enforce_limits ... ok
+test handshake_then_encrypted_data ... ok
+test unknown_client_key_is_rejected ... ok
+test changed_host_key_is_refused ... ok
+test recorded_login_can_be_replayed ... ok
+test result: ok. 7 passed; 0 failed
+test reply_has_rfc826_layout ... ok
+test all_preloaded_hosts_resolve ... ok
+test unknown_host_gets_no_reply ... ok
+test server_learns_the_sender ... ok
+test malformed_packets_are_ignored ... ok
+test any_request_can_overwrite_an_entry ... ok
+test client_uses_its_cache ... ok
+test second_client_finds_the_first ... ok
+test udp_round_trip_time ... ok
+test result: ok. 9 passed; 0 failed
+\end{lstlisting}
+\end{minipage}
+
+% ---------------------------------------------------------------- 5
+\section{Results}
+
+All measurements were taken on one Linux machine (4 cores, kernel 6.18, Rust
+1.97, release build) over the loopback interface.
+
+\subsection{Bytes on the wire}
+\label{sec:wire}
+
+Output of \texttt{handshake\_then\_encrypted\_data}. The relay split the
+captured byte streams back into frames; sizes include the 4-byte length.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l l r X@{}}
+\toprule
+Frame & Direction & Bytes & Make-up \\
+\midrule
+\texttt{HostKey}    & server $\to$ client & 21 & $4 + 1 + 8 + 8$, in clear \\
+\texttt{SessionKey} & client $\to$ server & 53 & $4 + 1 + 4 + (4 + 5 \times 8)$: 32 key bytes in five RSA blocks \\
+\texttt{Auth}       & client $\to$ server & 40 & $4 + 1 + (4 + 7) + 8 + 8 + 8$, user \texttt{student} \\
+\texttt{Success}    & server $\to$ client & 24 & $4 + 1 + 4 + 15$, ``welcome student'' \\
+\midrule
+\multicolumn{2}{@{}l}{Whole login}   & 138 & 93 up, 45 down \\
+\texttt{Data}, 20-byte command & client $\to$ server & 29 & 9 bytes of overhead per message \\
+\bottomrule
+\end{tabularx}
+\caption{Frames of one login and one command.}
+\label{tab:wire}
+\end{table}
+
+The test then searched the captured bytes. The command
+\texttt{echo secret-command} and the user name \texttt{student} appear in
+neither direction; only the host key and the RSA ciphertext of the session key
+are readable on the wire.
+
+\subsection{An ARP request and its reply}
+
+A request from \texttt{192.168.1.100} for \texttt{192.168.1.20}, and the
+server's answer, as captured by a small UDP client:
+
+\begin{lstlisting}[style=plain]
+request: 00 01 08 00 06 04 00 01 02 00 c0 a8 01 64 c0 a8 01 64 00 00 00 00 00 00 c0 a8 01 14
+reply:   00 01 08 00 06 04 00 02 00 1a 2b 3c 4d 14 c0 a8 01 14 02 00 c0 a8 01 64 c0 a8 01 64
+         <htype> <ptype> hl pl <oper> <---sender MAC--> <sender IP> <---target MAC--> <target IP>
+\end{lstlisting}
+
+The operation changed from 1 to 2, the found MAC \texttt{00:1a:2b:3c:4d:14}
+and \texttt{192.168.1.20} moved to the sender fields, and the requester moved to
+the target fields. A full request/reply round trip over loopback took
+36.4\,\textmu s on average over 1000 rounds (\texttt{udp\_round\_trip\_time}).
+An address that nobody knows costs the client its whole 2\,s timeout, because
+the server sends nothing back.
+
+\subsection{Breaking the 64-bit key}
+
+\texttt{factoring\_time\_by\_modulus\_size} builds 20 moduli for each size from
+two primes of half that size and factors them. Trial division was stopped at
+48 bits.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}r r r@{}}
+\toprule
+Modulus bits & Trial division (ms) & Pollard's rho (ms) \\
+\midrule
+24 & 0.002  & 0.003 \\
+32 & 0.035  & 0.006 \\
+40 & 0.896  & 0.017 \\
+48 & 14.558 & 0.063 \\
+56 & --     & 0.160 \\
+64 & --     & 1.018 \\
+\bottomrule
+\end{tabular}
+\caption{Mean time to factor one modulus (20 moduli per row).}
+\label{tab:factor}
+\end{table}
+
+\texttt{public\_key\_alone\_recovers\_session\_key} then attacked ten real
+\texttt{KeyPair::generate} keys, using nothing but the public key. Each was
+factored in 0.29--1.21\,ms (mean 0.85\,ms). In every case the recovered $d$ was
+the real private exponent, it decrypted a 32-byte session key encrypted to that
+host, and a signature made with it was accepted by \texttt{verify}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{semilogyaxis}[
+  width=0.62\textwidth, height=5.4cm,
+  xlabel={modulus bits}, ylabel={ms per modulus},
+  xtick={24,32,40,48,56,64},
+  legend pos=north west, legend style={font=\footnotesize},
+  grid=major, grid style={gray!25},
+  tick label style={font=\footnotesize}, label style={font=\small},
+]
+\addplot[mark=square*,red] coordinates {(24,0.002) (32,0.035) (40,0.896) (48,14.558)};
+\addplot[mark=*,blue] coordinates {(24,0.003) (32,0.006) (40,0.017) (48,0.063) (56,0.160) (64,1.018)};
+\addplot[dashed,red,forget plot] coordinates {(48,14.558) (56,233) (64,3727)};
+\legend{trial division, Pollard's rho}
+\end{semilogyaxis}
+\end{tikzpicture}
+\caption{Factoring time against modulus size. The dashed line extends trial division by its measured growth of about $16\times$ per 8 bits.}
+\label{fig:factor}
+\end{figure}
+
+\subsection{File copy time and the Nagle effect}
+
+Files of 1\,KB to 65\,000\,KB were copied five times in each direction with
+\texttt{rcp}, and the median time it reported is shown (connection, handshake
+and transfer). The first copies showed a floor of about 130\,ms even for one
+kilobyte. To find the cause, the same tests were repeated with a copy of the
+code in which \texttt{Transport::new} also calls
+\texttt{stream.set\_nodelay(true)}, which turns off Nagle's algorithm. This
+one-line change was only an experiment; it is not part of the submitted code.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}r r r r r@{}}
+\toprule
+& \multicolumn{2}{c}{as submitted} & \multicolumn{2}{c}{with \texttt{TCP\_NODELAY}} \\
+\cmidrule(lr){2-3}\cmidrule(l){4-5}
+File size (KB) & upload (ms) & download (ms) & upload (ms) & download (ms) \\
+\midrule
+1      & 129.9 & 131.6 & 0.75  & 0.57  \\
+4      & 131.6 & 129.9 & 0.71  & 0.62  \\
+16     & 130.0 & 130.0 & 0.85  & 0.87  \\
+64     & 86.2  & 86.3  & 0.91  & 0.79  \\
+256    & 85.9  & 89.7  & 1.69  & 1.31  \\
+1024   & 89.6  & 89.8  & 3.86  & 4.47  \\
+4096   & 100.0 & 101.4 & 13.76 & 13.47 \\
+16384  & 144.0 & 144.4 & 59.6  & 57.1  \\
+65000  & 324.8 & 372.6 & 288.9 & 280.3 \\
+65536  & \multicolumn{4}{c}{\texttt{rcp: packet too large}} \\
+\bottomrule
+\end{tabular}
+\caption{Median \texttt{rcp} time over loopback (5 runs per cell).}
+\label{tab:rcp}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{loglogaxis}[
+  width=0.62\textwidth, height=5.6cm,
+  xlabel={file size (KB)}, ylabel={upload time (ms)},
+  legend pos=north west, legend style={font=\footnotesize},
+  grid=major, grid style={gray!25},
+  tick label style={font=\footnotesize}, label style={font=\small},
+]
+\addplot[mark=square*,red] coordinates {(1,129.9) (4,131.6) (16,130.0) (64,86.2) (256,85.9) (1024,89.6) (4096,100.0) (16384,144.0) (65000,324.8)};
+\addplot[mark=*,blue] coordinates {(1,0.75) (4,0.71) (16,0.85) (64,0.91) (256,1.69) (1024,3.86) (4096,13.76) (16384,59.6) (65000,288.9)};
+\legend{as submitted, with \texttt{TCP\_NODELAY}}
+\end{loglogaxis}
+\end{tikzpicture}
+\caption{Upload time against file size.}
+\label{fig:rcp}
+\end{figure}
+
+The same difference shows in an interactive login. Twenty runs of
+\texttt{rsh connect} that type only \texttt{exit} took a median of 222.8\,ms
+(221.1--227.1\,ms) as submitted and 3.5\,ms (3.4--5.3\,ms) with
+\texttt{TCP\_NODELAY}, including process start-up and starting the remote shell.
+
+\subsection{Live run}
+
+One server and one client on the same machine, user \texttt{student}, empty
+\texttt{RSH\_HOME} (long paths shortened). The shell is \texttt{sh -i}, which
+prints its \texttt{\#} prompt on standard error.
+
+\begin{lstlisting}[style=plain]
+$ rsh-keygen -a
+The key fingerprint is:
+6b:d4:0f:0f:c2:ab:f5:a2 student@labpc
+Modulus n = 8775609486456326389 (64-bit), e = 65537
+Added key to $RSH_HOME/authorized_keys
+
+$ rsh connect 127.0.0.1
+# typed: whoami | GREETING=hello; echo $GREETING | cd /tmp && pwd | ls /nonexistent | exit 3
+Host '127.0.0.1:2222' is not known. Key fingerprint is ca:08:8a:d8:51:e2:89:5c.
+Warning: Permanently added '127.0.0.1:2222' to the list of known hosts.
+Connected to 127.0.0.1:2222. Type 'exit' to leave.
+sh: 0: can't access tty; job control turned off
+# root
+# # hello
+/tmp
+# ls: cannot access '/nonexistent': No such file or directory
+# Connection to 127.0.0.1 closed.               (rsh exit code 3)
+
+$ rcp notes.txt 127.0.0.1:backup.txt
+backup.txt                     100%         32 bytes       0.2 KB/s   0.13s
+$ rcp 127.0.0.1:missing.txt x.txt
+rcp: missing.txt: No such file or directory (os error 2)
+$ RSH_HOME=other rsh connect 127.0.0.1           # a key that is not authorized
+rsh: authentication failed: key 8e:d9:16:5a:ee:82:4c:94 is not in authorized_keys
+$ rsh connect 127.0.0.1                          # after the server made a new host key
+rsh: HOST KEY FOR 127.0.0.1:2222 HAS CHANGED (now d2:56:47:b2:18:09:6d:30). Remove its line ...
+\end{lstlisting}
+
+Server log for the same run:
+
+\begin{lstlisting}[style=plain]
+Host key fingerprint: ca:08:8a:d8:51:e2:89:5c
+rsh server listening on port 2222
+[127.0.0.1:33428] connected
+[127.0.0.1:33428] authenticated as student
+[127.0.0.1:33428] shell started (pid 5399)
+[127.0.0.1:33428] shell exited with code 3
+[127.0.0.1:33428] disconnected
+[127.0.0.1:33446] upload notes.txt -> backup.txt: Success("wrote 32 bytes to srv/backup.txt")
+[127.0.0.1:33458] download missing.txt
+[127.0.0.1:33474] closed: key 8e:d9:16:5a:ee:82:4c:94 is not in authorized_keys
+[127.0.0.1:33480] closed: failed to fill whole buffer          (client hung up after the host key)
+\end{lstlisting}
+
+The ARP server with two clients. Client A (\texttt{192.168.1.100}) looked up
+\texttt{.10} twice and \texttt{.99} once; client B (\texttt{192.168.1.101}) then
+looked up client A. Server log:
+
+\begin{lstlisting}[style=plain]
+127.0.0.1:47232 -> ARP Request: who has 192.168.1.10? tell 192.168.1.100 (02:00:c0:a8:01:64)
+Learned 192.168.1.100 is at 02:00:c0:a8:01:64
+127.0.0.1:47232 <- ARP Reply: 192.168.1.10 is at 00:1a:2b:3c:4d:0a
+127.0.0.1:47232 -> ARP Request: who has 192.168.1.99? tell 192.168.1.100 (02:00:c0:a8:01:64)
+No host has 192.168.1.99, request dropped
+127.0.0.1:49944 -> ARP Request: who has 192.168.1.100? tell 192.168.1.101 (02:00:c0:a8:01:65)
+Learned 192.168.1.101 is at 02:00:c0:a8:01:65
+127.0.0.1:49944 <- ARP Reply: 192.168.1.100 is at 02:00:c0:a8:01:64
+\end{lstlisting}
+
+Client A printed \texttt{Cache hit} for its second lookup of \texttt{.10},
+which sent nothing (the server log shows only one request), \texttt{No reply}
+for \texttt{.99}, and a cache table with \texttt{.10} expiring in 57\,s. Client B
+received A's MAC address, which the server had only learned from A's request.
+
+% ---------------------------------------------------------------- 6
+\section{Observations}
+
+\begin{enumerate}
+\item \textbf{The handshake does its job.} A new host key is remembered, a
+  changed one is refused, and a client key that is not in
+  \texttt{authorized\_keys} is turned away, both in the tests and in the live
+  run. A login costs 138 bytes and every later message 9 bytes of overhead.
+
+\item \textbf{Everything after the session key is hidden.} Neither the user name
+  nor the typed command appears in the captured traffic. Only the host key and
+  the RSA-encrypted session key travel in clear.
+
+\item \textbf{A 64-bit key is not a secret.} Pollard's rho factored every real
+  host key in about a millisecond, which gives the private key and with it the
+  session key and the whole recorded session. Its cost grows roughly as
+  $n^{1/4}$, about $4\times$ per 8 bits, while trial division grows as
+  $n^{1/2}$, about $16\times$ per 8 bits (Table~\ref{tab:factor}). Even trial
+  division would need only a few seconds at 64 bits.
+
+\item \textbf{Encryption without integrity can be changed and replayed.}
+  Flipping ciphertext bits flips the same plaintext bits, so \texttt{rm -i}
+  became \texttt{rm -f} without knowing the key. Because the client alone
+  chooses the session key and the server adds nothing random, a recorded login
+  can be sent again and is accepted. The attacker cannot read the replayed
+  session, but the server runs it.
+
+\item \textbf{Small messages wait for TCP, not for the network.} Every frame is
+  written as two \texttt{write} calls, a 4-byte length and then the body. With
+  Nagle's algorithm on, the second small segment waits for the ACK of the first,
+  and the receiver delays that ACK by about 40\,ms. Files up to 16\,KB took
+  $\approx 130\text{ ms} \approx 3 \times 43$\,ms; from 64\,KB, where the body is
+  larger than one loopback segment and goes out at once, they took
+  $\approx 86\text{ ms} \approx 2 \times 43$\,ms. With \texttt{TCP\_NODELAY}
+  a 1\,KB copy took 0.75\,ms and a login 3.5\,ms instead of 223\,ms, about
+  $64\times$ faster. Large files are limited by copying, about 200\,MB/s either
+  way.
+
+\item \textbf{One message per file sets a size limit.} A 65\,000\,KB file was
+  copied, but a 64\,MiB file fails with \texttt{packet too large}, because the
+  whole file must fit in one frame.
+
+\item \textbf{ARP trusts whatever it hears.} Learning from requests lets client
+  B find client A without any configuration, which is the point of ARP. The same
+  rule lets any host claim \texttt{192.168.1.1} and redirect the gateway to
+  itself (\texttt{any\_request\_can\_overwrite\_an\_entry}), which is exactly
+  ARP spoofing. The cache turns a repeated lookup into no traffic at all, and
+  matters most for a missing host, where a miss costs the full 2\,s timeout.
+\end{enumerate}
+
+% ---------------------------------------------------------------- 7
+\section{Possible Improvements}
+
+\begin{itemize}
+\item Write the length and the body of a frame in one \texttt{write} call, or
+  set \texttt{TCP\_NODELAY}. Section~5.4 shows this removes 40\,ms stalls and
+  makes a login about $64\times$ faster.
+\item Let the server send a random nonce with its host key and have the client
+  sign it as well, so that a recorded login cannot be replayed.
+\item Add a message authentication code with a sequence number to every frame,
+  so that changed, dropped or reordered messages are detected.
+\item Use larger keys (2048-bit RSA) with padding, a real hash and a real
+  cipher. The random generator should also be seeded with more than 64 bits.
+\item \texttt{rcp} writes a downloaded file to \texttt{local/<name>} with the name
+  the server sends. A malicious server could send \texttt{../../.bashrc}; the
+  client should accept a plain file name only, as the server already does for
+  uploads. Private key files should be created with mode \texttt{0600}.
+\item Send files in chunks instead of one message, which removes the 64\,MiB
+  limit and the need to hold the whole file in memory.
+\item Give the remote shell a pseudo-terminal, so that full-screen programs and
+  Ctrl+C work.
+\item In ARP, keep the preloaded entries static and log when a learned address
+  changes its MAC, which is how ARP spoofing is usually noticed.
+\end{itemize}
+
+% ---------------------------------------------------------------- 8
+\section{Comments}
+
+Building both protocols from the standard library alone made every layer
+visible: the bytes of an ARP packet, the length prefix of a frame, the RSA
+arithmetic and the order of the handshake messages. The tests showed that the
+design is right in structure, since host keys, authorized keys and encryption
+all behave as intended, but also why real protocols carry more than this: a key
+that can be factored in a millisecond, a session that can be replayed, and
+ciphertext that can be changed. The most surprising result was not about
+security at all. A small detail of how a frame is written, two writes instead
+of one, made every login 64 times slower, which only showed up once the
+programs were measured.
+
+\end{document}
