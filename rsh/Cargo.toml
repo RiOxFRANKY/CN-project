@@ -1,0 +1,3 @@
+[workspace]
+members = ["src/rsh-crypto", "src/rsh-main", "src/rsh-keygen", "src/rcp"]
+resolver = "2"

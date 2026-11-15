@@ -1,0 +1,8 @@
+[package]
+name = "rsh-keygen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rsh-crypto = { path = "../rsh-crypto" }
+rsh-main = { path = "../rsh-main" }

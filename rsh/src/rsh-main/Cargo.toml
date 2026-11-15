@@ -1,0 +1,15 @@
+[package]
+name = "rsh-main"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rsh_main"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rsh"
+path = "src/main.rs"
+
+[dependencies]
+rsh-crypto = { path = "../rsh-crypto" }
