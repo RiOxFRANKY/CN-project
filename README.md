@@ -96,8 +96,8 @@ The crypto is deliberately simple, for learning: 64-bit RSA keys can be factored
 
 Sending real ARP frames needs raw Ethernet access, so this version carries real 28-byte ARP packets (RFC 826 format: Ethernet/IPv4, request and reply) over UDP instead.
 
-- The **server** holds an IP → MAC table, answers requests for addresses it knows, and learns the sender's IP and MAC from every request, as real ARP does.
-- The **client** has its own IP and a MAC derived from it (`02:00:` + the IP bytes). It checks its **ARP cache** first, sends an ARP request on a miss, and caches the reply for 60 seconds.
+- The **server** holds an IP → MAC table, answers requests for addresses it knows, and learns dynamic senders' IP and MAC from valid requests. Preloaded infrastructure entries are marked static so spoofed requests cannot overwrite them, while MAC changes on dynamic hosts emit warnings.
+- The **client** has its own IP and a MAC derived from it (`02:00:` + the IP bytes). It short-circuits self-lookups, checks its **ARP cache** first, retries up to 3 times (600 ms timeout per attempt) on a miss, and caches replies for 60 seconds.
 
 ```bash
 cd arp
@@ -105,7 +105,7 @@ cargo run -- server [port]
 cargo run -- client [my-ip] [server] [port]
 ```
 
-Client input: an IPv4 address to resolve, `cache` to show the cache, or `quit`.
+Client input: an IPv4 address to resolve, `cache` to show the cache, `flush` to clear the cache, or `quit`.
 
 Hosts the server knows at startup:
 

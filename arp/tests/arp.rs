@@ -25,22 +25,35 @@ fn free_port() -> u16 {
 }
 
 fn start_server() -> Server {
-    let port = free_port();
-    let child = Command::new(BIN)
-        .args(["server", &port.to_string()])
-        .stdout(Stdio::null())
-        .spawn()
-        .unwrap();
-    let server = Server { child, port };
-    // Wait until it answers a lookup of a host it knows.
-    let probe = socket(&server, Duration::from_millis(100));
-    for _ in 0..50 {
-        probe.send(&packet(1, [2, 0, 9, 9, 9, 9], [9, 9, 9, 9], [0; 6], [192, 168, 1, 1])).unwrap();
-        if recv(&probe).is_some() {
-            return server;
+    for _ in 0..5 {
+        let port = free_port();
+        let mut child = Command::new(BIN)
+            .args(["server", &port.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // Give the server a brief moment; if it exited (port race), retry.
+        let mut failed = false;
+        let probe_addr = ("127.0.0.1", port);
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        probe.connect(probe_addr).unwrap();
+        probe.set_read_timeout(Some(Duration::from_millis(80))).unwrap();
+        for _ in 0..25 {
+            if let Ok(Some(_)) = child.try_wait() {
+                failed = true;
+                break;
+            }
+            let _ = probe.send(&packet(1, [2, 0, 9, 9, 9, 9], [9, 9, 9, 9], [0; 6], [192, 168, 1, 1]));
+            if recv(&probe).is_some() {
+                return Server { child, port };
+            }
+            std::thread::sleep(Duration::from_millis(30));
         }
-        // Before the server binds, a connected UDP socket fails at once.
-        std::thread::sleep(Duration::from_millis(50));
+        if !failed {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
     panic!("server did not start");
 }
@@ -128,7 +141,9 @@ fn malformed_packets_are_ignored() {
     wrong_len[4] = 8;
     let reply_op = packet(2, ME_MAC, ME_IP, [0; 6], [192, 168, 1, 1]);
     let short = packet(1, ME_MAC, ME_IP, [0; 6], [192, 168, 1, 1])[..20].to_vec();
-    for bad in [wrong_htype, wrong_ptype, wrong_len, reply_op, short, vec![]] {
+    let mut overlong = packet(1, ME_MAC, ME_IP, [0; 6], [192, 168, 1, 1]);
+    overlong.push(0xff);
+    for bad in [wrong_htype, wrong_ptype, wrong_len, reply_op, short, overlong, vec![]] {
         s.send(&bad).unwrap();
         assert!(recv(&s).is_none(), "answered {bad:?}");
     }
@@ -136,14 +151,30 @@ fn malformed_packets_are_ignored() {
 }
 
 #[test]
-fn any_request_can_overwrite_an_entry() {
+fn static_entry_cannot_be_spoofed() {
     let server = start_server();
     let attacker = socket(&server, Duration::from_secs(1));
     let victim = socket(&server, Duration::from_secs(1));
     let fake = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01];
     ask(&attacker, fake, [192, 168, 1, 1], [192, 168, 1, 10]).unwrap();
     let reply = ask(&victim, ME_MAC, ME_IP, [192, 168, 1, 1]).unwrap();
-    assert_eq!(&reply[8..14], &fake, "gateway now points at the attacker");
+    assert_eq!(
+        &reply[8..14],
+        &[0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x01],
+        "static gateway entry must remain protected"
+    );
+}
+
+#[test]
+fn invalid_sender_is_not_learned() {
+    let server = start_server();
+    let s = socket(&server, Duration::from_millis(300));
+    // Unspecified sender IP (0.0.0.0) and zero MAC must not enter the ARP table.
+    ask(&s, ME_MAC, [0, 0, 0, 0], [192, 168, 1, 1]).unwrap();
+    assert!(ask(&s, ME_MAC, ME_IP, [0, 0, 0, 0]).is_none());
+
+    ask(&s, [0; 6], [10, 0, 0, 99], [192, 168, 1, 1]).unwrap();
+    assert!(ask(&s, ME_MAC, ME_IP, [10, 0, 0, 99]).is_none());
 }
 
 fn run_client(server: &Server, my_ip: &str, input: &str) -> String {
@@ -176,6 +207,23 @@ fn second_client_finds_the_first() {
     let out = run_client(&server, "192.168.1.101", "192.168.1.100\nnot-an-ip\nquit\n");
     assert!(out.contains("192.168.1.100 is at 02:00:c0:a8:01:64"), "{out}");
     assert!(out.contains("Invalid IPv4 address: not-an-ip"));
+}
+
+#[test]
+fn client_self_lookup_flush_and_retries() {
+    let server = start_server();
+    let out = run_client(
+        &server,
+        "192.168.1.100",
+        "192.168.1.100\n192.168.1.10\nflush\n192.168.1.10\n192.168.1.99\nquit\n",
+    );
+    assert!(out.contains("Self: 192.168.1.100 is at 02:00:c0:a8:01:64"), "{out}");
+    assert!(out.contains("ARP cache flushed"), "{out}");
+    // Two network requests for 192.168.1.10 (one before flush, one after), plus one for .99
+    assert_eq!(out.matches("Sent: ARP Request").count(), 3, "{out}");
+    assert!(out.contains("Retry (2/3): ARP Request: who has 192.168.1.99?"), "{out}");
+    assert!(out.contains("Retry (3/3): ARP Request: who has 192.168.1.99?"), "{out}");
+    assert!(out.contains("No reply for 192.168.1.99"), "{out}");
 }
 
 #[test]

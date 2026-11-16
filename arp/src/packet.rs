@@ -8,7 +8,7 @@ pub const SIZE: usize = 28;
 const HTYPE_ETHERNET: u16 = 1;
 const PTYPE_IPV4: u16 = 0x0800;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mac(pub [u8; 6]);
 
 impl Mac {
@@ -17,6 +17,10 @@ impl Mac {
     pub fn from_ip(ip: Ipv4Addr) -> Mac {
         let [a, b, c, d] = ip.octets();
         Mac([0x02, 0x00, a, b, c, d])
+    }
+
+    pub fn is_valid_unicast(&self) -> bool {
+        self.0 != [0; 6] && (self.0[0] & 1) == 0
     }
 }
 
@@ -72,7 +76,7 @@ impl ArpPacket {
     }
 
     pub fn decode(b: &[u8]) -> Option<Self> {
-        if b.len() < SIZE
+        if b.len() != SIZE
             || u16::from_be_bytes([b[0], b[1]]) != HTYPE_ETHERNET
             || u16::from_be_bytes([b[2], b[3]]) != PTYPE_IPV4
             || b[4] != 6
@@ -81,11 +85,16 @@ impl ArpPacket {
             return None;
         }
 
+        let op = u16::from_be_bytes([b[6], b[7]]);
+        if op != REQUEST && op != REPLY {
+            return None;
+        }
+
         let mac = |i: usize| Mac([b[i], b[i + 1], b[i + 2], b[i + 3], b[i + 4], b[i + 5]]);
         let ip = |i: usize| Ipv4Addr::new(b[i], b[i + 1], b[i + 2], b[i + 3]);
 
         Some(ArpPacket {
-            op: u16::from_be_bytes([b[6], b[7]]),
+            op,
             sender_mac: mac(8),
             sender_ip: ip(14),
             target_mac: mac(18),
@@ -105,5 +114,42 @@ impl fmt::Display for ArpPacket {
             REPLY => write!(f, "ARP Reply: {} is at {}", self.sender_ip, self.sender_mac),
             op => write!(f, "ARP op {op}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mac_helpers_work() {
+        let mac = Mac::from_ip(Ipv4Addr::new(192, 168, 1, 100));
+        assert_eq!(mac.to_string(), "02:00:c0:a8:01:64");
+        assert!(mac.is_valid_unicast());
+        assert!(!Mac::ZERO.is_valid_unicast());
+        assert!(!Mac([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]).is_valid_unicast());
+    }
+
+    #[test]
+    fn packet_round_trip_and_strict_decode() {
+        let req = ArpPacket::request(
+            Mac::from_ip(Ipv4Addr::new(192, 168, 1, 100)),
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 10),
+        );
+        let bytes = req.encode();
+        let decoded = ArpPacket::decode(&bytes).expect("valid request");
+        assert_eq!(decoded.op, REQUEST);
+        assert_eq!(decoded.sender_ip, req.sender_ip);
+        assert_eq!(decoded.target_ip, req.target_ip);
+
+        // Trailing byte and invalid opcode must be rejected.
+        let mut with_extra = bytes.to_vec();
+        with_extra.push(0);
+        assert!(ArpPacket::decode(&with_extra).is_none());
+
+        let mut bad_op = bytes;
+        bad_op[7] = 9;
+        assert!(ArpPacket::decode(&bad_op).is_none());
     }
 }

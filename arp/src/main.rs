@@ -33,7 +33,10 @@ fn main() {
 }
 
 fn port(arg: Option<&String>) -> u16 {
-    arg.and_then(|p| p.parse().ok()).unwrap_or(DEFAULT_PORT)
+    match arg {
+        None => DEFAULT_PORT,
+        Some(p) => p.parse().unwrap_or_else(|_| usage()),
+    }
 }
 
 fn usage() -> ! {

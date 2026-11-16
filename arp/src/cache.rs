@@ -26,6 +26,10 @@ impl Cache {
         self.entries.insert(ip, (mac, Instant::now()));
     }
 
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     pub fn print(&mut self) {
         self.remove_expired();
         if self.entries.is_empty() {
@@ -41,5 +45,22 @@ impl Cache {
 
     fn remove_expired(&mut self) {
         self.entries.retain(|_, (_, added)| added.elapsed() < TTL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_get_and_clear() {
+        let mut cache = Cache::new();
+        let ip = Ipv4Addr::new(192, 168, 1, 10);
+        let mac = Mac::from_ip(ip);
+        assert_eq!(cache.get(ip), None);
+        cache.insert(ip, mac);
+        assert_eq!(cache.get(ip), Some(mac));
+        cache.clear();
+        assert_eq!(cache.get(ip), None);
     }
 }
