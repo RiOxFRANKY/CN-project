@@ -1,0 +1,474 @@
+% ---------------------------------------------------------------- Cryptographic implementation
+\section{Cryptographic Implementation}
+\label{sec:crypto}
+
+All cryptography is written from scratch in the \texttt{rsh-crypto} crate,
+about 410 lines with no dependencies. This section explains each part and then
+follows one real recorded session byte by byte. The worked values come from a
+session between the real \texttt{rsh} server and client, recorded through the
+TCP relay of Section~\ref{sec:telnetwire} and decoded afterwards with the
+server's private key (\texttt{report/tools/decoder}). Every table in
+Sections~\ref{sec:hostkey}--\ref{sec:packets} is generated from that recording
+(\texttt{report/data/}), and every value was checked by the decoder against the
+library code itself.
+
+\begin{table}[H]
+\centering
+\footnotesize
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+Building block & File & Used for \\
+\midrule
+Modular arithmetic & \texttt{math.rs} & $a b \bmod m$, $a^{k} \bmod m$, $a^{-1} \bmod m$ on 64-bit numbers \\
+Random numbers & \texttt{random.rs} & candidate primes, the 32-byte session key \\
+Miller--Rabin & \texttt{prime.rs} & testing candidate primes \\
+RSA, 64-bit modulus & \texttt{rsa.rs} & sending the session key; signing the login \\
+Digest $H$ (FNV-1a) & \texttt{hash.rs} & the value that is signed; key fingerprints \\
+Stream cipher & \texttt{cipher.rs} & encrypting every message after the key exchange \\
+Key files & \texttt{keyfile.rs} & \texttt{id\_rsh}, \texttt{host\_key}, \texttt{authorized\_keys}, \texttt{known\_hosts} \\
+\bottomrule
+\end{tabularx}
+\caption{The cryptographic building blocks.}
+\end{table}
+
+RSA is slow and works only on numbers smaller than $n$, so it is used twice per
+connection: once to send the session key and once to sign the login. All the
+terminal traffic is then encrypted with the fast stream cipher. Real SSH divides
+the work the same way: public-key operations only to agree on a key and to
+authenticate, a symmetric cipher for the data.
+
+% ................................................................
+\subsection{Modular arithmetic}
+
+Every RSA operation is arithmetic modulo $n < 2^{64}$. The product of two such
+numbers needs up to 128 bits, so \texttt{mul\_mod} widens to \texttt{u128}
+before reducing:
+\[
+  \texttt{mul\_mod}(a, b, m) = (a \cdot b) \bmod m, \qquad a, b < m < 2^{64}, \quad a \cdot b < 2^{128}.
+\]
+\texttt{pow\_mod} computes $b^{k} \bmod m$ by \emph{square and multiply}. It
+reads the exponent bit by bit from the lowest bit up: the base is squared at
+every step and multiplied into the result where the bit is 1. A 64-bit exponent
+therefore costs at most 64 squarings and 64 multiplications, instead of $k$
+multiplications. \texttt{inv\_mod} finds $a^{-1} \bmod m$ with the extended
+Euclidean algorithm, which keeps $s$ such that $\mathit{old\_r} \equiv
+\mathit{old\_s} \cdot a \pmod m$ at every step.
+
+\Needspace{24\baselineskip}
+\begin{lstlisting}[caption={Square and multiply, and the modular inverse (\texttt{math.rs}).}]
+pub fn pow_mod(mut base: u64, mut exp: u64, m: u64) -> u64 {
+    if m == 1 { return 0; }
+    let mut result = 1;
+    base %= m;
+    while exp > 0 {
+        if exp & 1 == 1 { result = mul_mod(result, base, m); }   // bit is 1: multiply
+        base = mul_mod(base, base, m);                            // square for the next bit
+        exp >>= 1;
+    }
+    result
+}
+pub fn inv_mod(a: u64, m: u64) -> Option<u64> {
+    let (mut old_r, mut r) = (a as i128, m as i128);
+    let (mut old_s, mut s) = (1i128, 0i128);
+    while r != 0 {
+        let q = old_r / r;
+        (old_r, r) = (r, old_r - q * r);
+        (old_s, s) = (s, old_s - q * s);
+    }
+    if old_r != 1 { return None; }                  // gcd(a, m) != 1: no inverse
+    Some(old_s.rem_euclid(m as i128) as u64)
+}
+\end{lstlisting}
+
+% ................................................................
+\subsection{RSA by hand, with a small key}
+
+The same functions work on small numbers, which makes them easy to check by
+hand. Take $p = 61$ and $q = 53$:
+\[
+  n = 61 \cdot 53 = 3233, \qquad \varphi = 60 \cdot 52 = 3120, \qquad e = 65537 .
+\]
+\textbf{Private exponent.} \texttt{inv\_mod(65537, 3120)} runs as in
+Table~\ref{tab:toyeuclid} and gives $d = -367 \bmod 3120 = 2753$. Check:
+$65537 \cdot 2753 = 180\,423\,361 = 57\,828 \cdot 3120 + 1$.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}r r r r r@{}}
+\toprule
+$\mathit{old\_r}$ & $r$ & $q = \lfloor \mathit{old\_r} / r \rfloor$ & $\mathit{old\_s}$ & $s$ \\
+\midrule
+65537 & 3120 & 21  & 1    & 0 \\
+3120  & 17   & 183 & 0    & 1 \\
+17    & 9    & 1   & 1    & $-183$ \\
+9     & 8    & 1   & $-183$ & 184 \\
+8     & 1    & 8   & 184  & $-367$ \\
+1     & 0    & --  & $-367$ & 3120 \\
+\bottomrule
+\end{tabular}
+\caption{Extended Euclid for $65537^{-1} \bmod 3120$. It stops with $\mathit{old\_r} = 1 = \gcd$, so the inverse exists.}
+\label{tab:toyeuclid}
+\end{table}
+
+\textbf{Encryption.} Encrypt the letter \texttt{A}, $m = 65$. The exponent
+$65537 = 2^{16} + 1$ has only two 1-bits, so \texttt{pow\_mod} squares 16 times
+and multiplies twice: $c = 65^{2^{16}} \cdot 65 \bmod 3233$.
+
+\begin{table}[H]
+\centering
+\small
+\setlength{\tabcolsep}{3.2pt}
+\begin{tabular}{@{}l *{17}{r}@{}}
+\toprule
+$k$ & 0 & 1 & 2 & 3 & 4 & 5 & 6 & 7 & 8 & 9 & 10 & 11 & 12 & 13 & 14 & 15 & 16 \\
+$65^{2^k} \bmod 3233$ & 65 & 992 & 1232 & 1547 & 789 & 1785 & 1720 & 205 & 3229 & 16 & 256 & 876 & 1155 & 2029 & 1232 & 1547 & 789 \\
+bit $k$ of $e$ & 1 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 0 & 1 \\
+\bottomrule
+\end{tabular}
+\caption{Repeated squaring of $65$ modulo $3233$.}
+\end{table}
+
+\[
+  c = 789 \cdot 65 \bmod 3233 = 51\,285 \bmod 3233 = 2790, \qquad
+  m = 2790^{2753} \bmod 3233 = 65 = \texttt{A}.
+\]
+Decryption uses the same \texttt{pow\_mod} with $d = 2753 =
+\texttt{101011000001}_2$ (12 squarings, 5 multiplications) and gives back 65.
+This works because $e d \equiv 1 \pmod{\varphi}$, so
+$m^{ed} = m^{1 + k\varphi} \equiv m \pmod n$ by Euler's theorem.
+
+% ................................................................
+\subsection{Making a key pair}
+\label{sec:hostkey}
+
+\texttt{KeyPair::generate} does the same with two random 32-bit primes.
+\texttt{random\_prime} takes a 64-bit random number, keeps the low 32 bits,
+sets the top bit (so that the prime really has 32 bits) and the low bit (so
+that it is odd), and tests it with Miller--Rabin until one is prime. Setting the
+top bit of both primes gives $n \geq 2^{62}$, so every 7-byte block
+($< 2^{56}$) is smaller than $n$. The host key of the recorded session:
+
+\begin{table}[H]
+\centering
+\small
+\input{gen/keygen.tex}
+\caption{The host key of the recorded session, made by the same steps as \texttt{KeyPair::generate}.}
+\label{tab:hostkey}
+\end{table}
+
+\textbf{Miller--Rabin.} Write $p - 1 = 2^{s} d$ with $d$ odd. If $p$ is prime,
+then for every witness $a$ the sequence $a^{d}, a^{2d}, \ldots, a^{2^{s-1}d}
+\pmod p$ either starts at 1 or reaches $p - 1$. A composite number fails this
+for most $a$, and with the first twelve primes $2, 3, \ldots, 37$ as witnesses no composite
+below $3.1 \cdot 10^{23}$ passes, so the test is exact for every 64-bit number. For $p$ above:
+
+\begin{table}[H]
+\centering
+\small
+\input{gen/miller_rabin.tex}
+\caption{The first three of the twelve Miller--Rabin witnesses for $p$.}
+\end{table}
+
+% ................................................................
+\subsection{Encrypting the session key with RSA}
+\label{sec:rsablocks}
+
+The client makes a random 32-byte session key $K$. In the recorded session:
+\begin{center}
+\input{gen/session_key.tex}
+\end{center}
+\texttt{PublicKey::encrypt} writes the plaintext length (4 bytes), then cuts the
+data into 7-byte blocks. Each block is placed in the low 7 bytes of a 64-bit
+number $m_i$, whose top byte stays 0, so that $m_i < 2^{56} \leq n$. Each block
+is encrypted separately, $c_i = m_i^{e} \bmod n$, and written as 8 bytes. The
+last block is padded with zeros; the length field tells the receiver how many
+bytes to keep. 32 key bytes therefore need $\lceil 32/7 \rceil = 5$ blocks, or
+$4 + 5 \cdot 8 = 44$ bytes.
+
+\begin{table}[H]
+\centering
+\footnotesize
+\input{gen/rsa_blocks.tex}
+\caption{The session key under RSA with the host key of Table~\ref{tab:hostkey}.}
+\label{tab:rsablocks}
+\end{table}
+
+The \texttt{SessionKey} message carries the 44 bytes as a byte field, so the
+whole frame is 53 bytes. It is the second frame of the connection and is not
+encrypted by the stream cipher, which does not exist yet:
+
+\input{gen/sessionkey_frame.tex}
+
+The server runs \texttt{PrivateKey::decrypt}: for each $c_i$ it computes
+$c_i^{d} \bmod n$ and keeps bytes 1--7, and from the last block only as many
+bytes as the length field still needs. It ends up with the same 32 bytes.
+An observer sees only $c_0, \ldots, c_4$ and, without $d$, cannot undo the
+exponentiation (Section~\ref{sec:cryptolimits} shows that with a 64-bit $n$ this
+is not true in practice).
+
+\Needspace{14\baselineskip}
+\begin{lstlisting}[caption={Block encryption (\texttt{rsa.rs}).}]
+pub fn encrypt(&self, data: &[u8]) -> Vec<u8> {
+    let mut out = (data.len() as u32).to_be_bytes().to_vec();   // plaintext length
+    for chunk in data.chunks(PLAIN_BLOCK) {                      // 7 bytes at a time
+        let mut block = [0u8; 8];
+        block[1..1 + chunk.len()].copy_from_slice(chunk);        // top byte stays 0
+        let m = u64::from_be_bytes(block);
+        out.extend_from_slice(&pow_mod(m, self.e, self.n).to_be_bytes());
+    }
+    out
+}
+\end{lstlisting}
+
+% ................................................................
+\subsection{The digest and the signature}
+\label{sec:signature}
+
+\textbf{Digest.} Signatures are made over a 64-bit digest $H(x)$ instead of
+the data itself. It is built from FNV-1a, which processes one byte at a time:
+\[
+  h_0 = \texttt{cbf29ce484222325}_{16}, \qquad
+  h_{i+1} = (h_i \oplus x_i) \cdot \texttt{100000001b3}_{16} \bmod 2^{64}.
+\]
+To mix the bits further, the digest hashes the data a second time with the
+first result appended and combines the two:
+\[
+  f = \mathrm{FNV1a}(x), \qquad
+  H(x) = \mathrm{rotl}_{17}\bigl(\mathrm{FNV1a}(x \,\Vert\, f)\bigr) \oplus f .
+\]
+The fingerprint of a key, as printed by \texttt{rsh-keygen} and on first
+connection, is $H(n \Vert e)$ written as eight hex bytes, for example
+\texttt{0d:28:4c:ec:4e:a1:d9:04} for the host key above.
+
+\textbf{Signature.} RSA signing is decryption with the private key applied to
+the digest: $\sigma = (H(x) \bmod n)^{d} \bmod n$. Anyone with the public key
+checks $\sigma^{e} \bmod n = H(x) \bmod n$. In the login the signed data is
+\[
+  x = \texttt{"rsh-auth"} \,\Vert\, K \,\Vert\, \textit{user}.
+\]
+Because $K$ is fresh for every connection and only the real server can know it,
+the signature proves that the client holds the private key \emph{now}, and it
+cannot be moved to a connection with a different session key. The prefix
+\texttt{"rsh-auth"} keeps this signature from being valid for any other purpose.
+
+\begin{table}[H]
+\centering
+\footnotesize
+\input{gen/auth.tex}
+\caption{The login signature of the recorded session. $n_c$, $d_c$ are the client's key (\texttt{id\_rsh}).}
+\label{tab:auth}
+\end{table}
+
+% ................................................................
+\subsection{The stream cipher}
+\label{sec:cipher}
+
+A stream cipher turns a key into a long pseudo-random \emph{keystream}
+$k_0, k_1, k_2, \ldots$ and encrypts by XOR:
+\[
+  \text{ciphertext}_j = \text{plaintext}_j \oplus k_j, \qquad
+  \text{plaintext}_j = \text{ciphertext}_j \oplus k_j .
+\]
+Encryption and decryption are the same operation, and the ciphertext is exactly
+as long as the plaintext. Both ends compute the same keystream from $K$, so
+nothing but $K$ has to be shared. The generator has four 64-bit state words
+$s_0, \ldots, s_3$ and is built in three steps (\texttt{StreamCipher::new}).
+
+\begin{enumerate}
+\item \textbf{Direction label.} Each direction has its own label,
+  \texttt{"rsh client to server"} or \texttt{"rsh server to client"}. Its
+  FNV-1a hash seeds \texttt{splitmix64}, which fills the four state words:
+  \begin{align*}
+    z &\leftarrow z + \texttt{9e3779b97f4a7c15}, &
+    z &\leftarrow (z \oplus (z \gg 30)) \cdot \texttt{bf58476d1ce4e5b9}, \\
+    z &\leftarrow (z \oplus (z \gg 27)) \cdot \texttt{94d049bb133111eb}, &
+    s_i &= z \oplus (z \gg 31),
+  \end{align*}
+  all modulo $2^{64}$, once for each $s_i$.
+\item \textbf{Key.} The 32 key bytes are read as four little-endian words
+  $w_0, \ldots, w_3$, and $s_i \leftarrow s_i \oplus w_i$.
+\item \textbf{Warm-up.} The first 16 outputs are thrown away, so that the
+  first keystream bytes are not a simple function of the mixed-in key.
+\end{enumerate}
+
+\noindent Each step of the generator (the \texttt{xoshiro256**} design) outputs
+one 64-bit word and updates the state:
+\begin{gather*}
+  \text{out} = \mathrm{rotl}_{7}(5 s_1) \cdot 9 \bmod 2^{64}, \qquad t = s_1 \ll 17, \\
+  s_2 \mathrel{\oplus}= s_0,\quad
+  s_3 \mathrel{\oplus}= s_1,\quad
+  s_1 \mathrel{\oplus}= s_2,\quad
+  s_0 \mathrel{\oplus}= s_3,\quad
+  s_2 \mathrel{\oplus}= t,\quad
+  s_3 = \mathrm{rotl}_{45}(s_3).
+\end{gather*}
+The 8 bytes of each output word, lowest byte first, are the next 8 keystream
+bytes. \texttt{apply} keeps the unused bytes of the current word between calls,
+so splitting a message into pieces gives the same result
+(\texttt{stream\_cipher\_round\_trip\_and\_directions}).
+
+\begin{table}[H]
+\centering
+\scriptsize
+\input{gen/cipher_setup.tex}
+\caption{Setting up the two ciphers of the recorded session from $K$. The decoder repeated these steps on its own and got the same keystream as \texttt{StreamCipher}.}
+\label{tab:ciphersetup}
+\end{table}
+
+The two directions use the same $K$ but different labels, so their keystreams
+are unrelated (Table~\ref{tab:ciphersetup}, last two rows). This matters: if both
+directions used one keystream, XOR-ing a client byte with the server byte at the
+same position would cancel the key and leave the XOR of the two plaintexts.
+
+% ................................................................
+\subsection{Encrypting each packet}
+\label{sec:packets}
+\label{sec:rshsession}
+
+\textbf{The rule.} Every message is sent as one frame:
+\[
+  \underbrace{\text{len}}_{\text{4 bytes, clear}} \;\Vert\;
+  \underbrace{\text{encode}(\text{message}) \oplus k_{o}\,k_{o+1} \ldots k_{o+\text{len}-1}}_{\text{body}},
+\]
+where $o$ is the number of bytes this direction has already encrypted. Each
+side keeps one cipher for sending and one for receiving, and each cipher just
+continues where the previous message stopped. No counter or nonce travels with
+the frame; both ends stay in step because TCP delivers every byte exactly once
+and in order. The length stays in clear because the receiver needs it to find
+the end of the frame before it can decrypt anything. The first two frames,
+\texttt{HostKey} and \texttt{SessionKey}, are sent before the key exists and
+are not encrypted.
+
+\textbf{The recorded session.} The client typed \texttt{whoami},
+\texttt{echo hello} and \texttt{exit}, with a pause after each. All 16 frames, in
+the order they arrived:
+
+\begin{table}[H]
+\centering
+\footnotesize
+\input{gen/timeline.tex}
+\caption{Every frame of the recorded session. ``Keystream'' gives the positions of the keystream bytes used for the body.}
+\label{tab:timeline}
+\end{table}
+
+Frames~1--4 are the handshake of Figure~\ref{fig:handshake}. In frame~5 the
+client asks for a shell, and in frame~6 the server confirms that the shell
+started. Frames~7--16 are the interactive phase. Frame~7 is a warning that
+\texttt{sh} printed to standard error, and frames~9 and~13 are its prompt
+\texttt{\#~}. Each typed line is one \texttt{Data} message (frames 8, 11 and 14)
+and each piece of output another (10 and 12). After \texttt{exit} the server
+sends \texttt{Exit(0)} (frame 15), and the client answers \texttt{Disconnect}
+(frame 16). The tables below
+show how five of these frames were encrypted.
+
+\textbf{Frame 3: \texttt{Auth}.} The first encrypted frame of the client, so its
+body uses keystream bytes 0--35, the first 36 bytes of the client$\to$server
+stream in Table~\ref{tab:ciphersetup}.
+
+\begin{table}[H]
+\centering
+\input{gen/xor_auth.tex}
+\caption{Encryption of the \texttt{Auth} message: user \texttt{student}, the client's public key $(n_c, e)$ and the signature $\sigma$ of Table~\ref{tab:auth}.}
+\end{table}
+
+\textbf{Frame 5: \texttt{Shell}.} The body is a single tag byte, \texttt{06}.
+The client$\to$server stream is at position 36 after the 36-byte \texttt{Auth}
+body, so it uses one keystream byte:
+
+\begin{table}[H]
+\centering
+\input{gen/xor_shell.tex}
+\caption{Encryption of the \texttt{Shell} request.}
+\end{table}
+
+\textbf{Frame 8: typing \texttt{whoami}.} The client's terminal sends the line
+with its newline. The \texttt{Data} message is the tag \texttt{07}, a 4-byte
+length and the 7 bytes:
+
+\begin{table}[H]
+\centering
+\input{gen/xor_whoami.tex}
+\caption{Encryption of the typed line \texttt{whoami}.}
+\label{tab:xorwhoami}
+\end{table}
+
+Compare this with the Telnet line in Table~\ref{tab:telnetpw}: there, the
+bytes on the wire were the characters themselves; here they are
+\texttt{40 ec a6 a8 bc 32 35}.
+
+\textbf{Frame 10: the answer \texttt{root}.} The shell's output travels in the
+other direction, with the server$\to$client keystream:
+
+\begin{table}[H]
+\centering
+\input{gen/xor_root.tex}
+\caption{Encryption of the shell's output \texttt{root}.}
+\end{table}
+
+\textbf{Frame 15: \texttt{Exit(0)}.} The exit code is sent as a 64-bit number:
+
+\begin{table}[H]
+\centering
+\input{gen/xor_exit.tex}
+\caption{Encryption of the shell's exit code.}
+\end{table}
+
+\textbf{Decryption.} The receiver reads the 4-byte length, reads that many
+bytes, XORs them with the next bytes of its receiving keystream, which are the
+same bytes the sender used, and decodes the message. \texttt{Message::decode}
+then checks that the tag is known, that every length fits and that no bytes are
+left over, so a frame decrypted with the wrong keystream usually fails there
+instead of producing a wrong message.
+
+% ................................................................
+\subsection{Key files}
+
+Keys are stored as one line of text each, with numbers in hexadecimal. The
+files of the recorded session, all in \texttt{\$RSH\_HOME}:
+
+\begin{lstlisting}[style=plain]
+host_key          rsh-rsa-private daa9695e409806ab 10001 a7b5ec83dc4684d1   # n, e, d
+host_key.pub      rsh-rsa daa9695e409806ab 10001 host                       # n, e, comment
+id_rsh.pub        rsh-rsa 7824e3afbf97166f 10001 student@labpc
+authorized_keys   rsh-rsa 7824e3afbf97166f 10001 student@labpc              # one client per line
+known_hosts       127.0.0.1:2401 rsh-rsa daa9695e409806ab 10001             # host:port, then key
+\end{lstlisting}
+
+\noindent Here $\texttt{daa9695e409806ab}_{16} = 15\,756\,240\,624\,863\,938\,219$
+is $n$ and $\texttt{a7b5ec83dc4684d1}_{16} = 12\,084\,825\,226\,199\,074\,001$
+is $d$ of Table~\ref{tab:hostkey}.
+
+% ................................................................
+\subsection{Limits of this design}
+\label{sec:cryptolimits}
+
+The scheme is complete in structure but weak in its parts. Each weakness below
+was shown by a test (Section~\ref{sec:tests}) or by the recorded session.
+
+\begin{itemize}
+\item \textbf{The modulus can be factored.} With $n < 2^{64}$, Pollard's rho
+  finds $p$ in about a millisecond (Table~\ref{tab:factor}). From $p$ and $q$
+  follow $\varphi$ and $d$, from $d$ the session key in
+  Table~\ref{tab:rsablocks}, and from the session key the whole recorded
+  session. The decoder used in this section does the same, except that it was
+  given $d$ instead of computing it.
+\item \textbf{Known plaintext gives keystream away.} Many plaintext bytes can be
+  guessed: tags, length fields, prompts. In Table~\ref{tab:xorwhoami} the
+  length field is \texttt{00 00 00 07}, so the wire bytes \texttt{b0 b1 3c}
+  \emph{are} keystream bytes 38--40. The generator was designed for simulations,
+  not for cryptography, and its state can be computed from enough known
+  output.
+\item \textbf{No integrity.} Flipping a ciphertext bit flips the same plaintext
+  bit. Knowing only the position, an attacker turned \texttt{rm -i} into
+  \texttt{rm -f} (\texttt{flipped\_ciphertext\_bit\_\allowbreak flips\_plaintext\_bit}).
+  Real protocols add a message authentication code to every frame.
+\item \textbf{No server randomness.} Only the client chooses $K$, so a recorded
+  \texttt{SessionKey} and \texttt{Auth} can be sent again and are accepted
+  (\texttt{recorded\_login\_can\_be\_replayed}).
+\item \textbf{Textbook RSA.} Blocks are encrypted without random padding, so
+  the same 7 bytes under the same key always give the same 8 bytes. With a
+  random 32-byte key this leaks nothing here, but it would for guessable data.
+\item \textbf{A 64-bit seed.} The session key comes from a generator with 64
+  bits of state, so a 32-byte key has at most $2^{64}$ possible values.
+\end{itemize}

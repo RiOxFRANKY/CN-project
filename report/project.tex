@@ -32,6 +32,7 @@
 \captionsetup{font=small}
 \captionsetup[lstlisting]{font=small,skip=4pt}
 \setlist{itemsep=3pt,topsep=4pt}
+\setlength{\emergencystretch}{3em}
 
 \lstdefinelanguage{Rust}{
   morekeywords={as,break,const,continue,else,enum,false,fn,for,if,impl,in,let,loop,
@@ -86,14 +87,19 @@
 % ---------------------------------------------------------------- 1
 \section{Problem Statement}
 
-Implement two network protocols in Rust, using only the standard library. The
-first is a basic \emph{secure shell}: a server that gives an authenticated
-client a remote shell over an encrypted TCP connection, together with a key
-generator and a file copy tool, in the style of \texttt{ssh},
-\texttt{ssh-keygen} and \texttt{scp}. The second is the \emph{Address
-Resolution Protocol}: a server that keeps an IP $\rightarrow$ MAC table and a
-client that resolves addresses and caches the answers, exchanging packets in
-the RFC~826 format.
+Implement network protocols in Rust, using only the standard library. The
+first is a remote terminal. It was built first as a \emph{Telnet} server and
+client (RFC~854), and then turned into an \emph{encrypted Telnet}, called
+rsh: a server that gives an authenticated client a remote shell over an
+encrypted TCP connection, together with a key generator and a file copy tool,
+in the style of \texttt{ssh}, \texttt{ssh-keygen} and \texttt{scp}. All of
+its cryptography (RSA, a digest, a stream cipher) is implemented from scratch.
+The second protocol is the \emph{Address Resolution Protocol}: a server that
+keeps an IP $\rightarrow$ MAC table and a client that resolves addresses and
+caches the answers, exchanging packets in the RFC~826 format.
+
+% ---------------------------------------------------------------- Telnet
+\input{sections/telnet}
 
 % ---------------------------------------------------------------- 2
 \section{Design}
@@ -127,7 +133,9 @@ from every request it sees. The client derives its MAC from its IP
 (\texttt{02:00:} followed by the four IP bytes), looks in its cache first, sends
 a request on a miss and caches the reply for 60 seconds.
 
-\subsection{Cryptography}
+\input{sections/rsh-design}
+
+\subsection{Cryptography in brief}
 
 The RSA key uses two random 32-bit primes $p, q$, which gives a 64-bit modulus:
 \[
@@ -141,7 +149,9 @@ from FNV-1a. Primes are found with the Miller--Rabin test using the first twelve
 primes as witnesses, which is exact for every 64-bit number. The session cipher
 is a \texttt{xoshiro256}-style generator seeded from the session key and a
 direction label, so that client$\to$server and server$\to$client never share a
-keystream. Figure~\ref{fig:handshake} shows the full exchange.
+keystream. Figure~\ref{fig:handshake} shows the full exchange, and
+Section~\ref{sec:crypto} explains every step with values from a recorded
+session.
 
 \begin{figure}[H]
 \centering
@@ -275,6 +285,9 @@ cargo run -- client [my-ip] [server] [port]       # input: an IPv4 address | cac
 cargo test
 \end{lstlisting}
 
+% ---------------------------------------------------------------- cryptography
+\input{sections/crypto}
+
 % ---------------------------------------------------------------- 3
 \section{Implementation}
 
@@ -313,6 +326,7 @@ true
 \end{lstlisting}
 
 \subsection{Framing and encryption}
+\label{sec:framing}
 
 The sender encodes the message, runs it through its cipher and writes one
 frame. The receiver does the reverse. Because the two directions use separate
@@ -354,14 +368,10 @@ if !key.verify(&auth::auth_data(&session_key, &user), signature) { /* refuse */ 
 t.send(&Message::Success(format!("welcome {user}")))?;
 \end{lstlisting}
 
-\subsection{Remote shell}
+\input{sections/rsh-session}
 
-The server starts one shell per connection with piped standard streams. One
-thread per output stream (\emph{pump}) reads the pipe and sends \texttt{Data};
-the session thread writes incoming \texttt{Data} to the shell's input. A third
-thread waits for the pumps to finish, collects the exit code and sends
-\texttt{Exit}. On Windows, \texttt{cmd.exe} echoes every input line, so the
-\texttt{EchoFilter} removes the echo before it reaches the client.
+The output side is one \emph{pump} per pipe. Each sends what the shell printed
+as a \texttt{Data} message, through the shared \texttt{Sender}:
 
 \Needspace{17\baselineskip}
 \begin{lstlisting}[caption={An output pump (\texttt{server/shell.rs}).}]
@@ -405,6 +415,7 @@ reported as \texttt{No reply}.
 
 % ---------------------------------------------------------------- 4
 \section{Test Cases}
+\label{sec:tests}
 
 The projects had no tests, so three test files were added without changing the
 programs. The rsh tests use the library crates directly; the handshake tests run
@@ -610,6 +621,7 @@ host, and a signature made with it was accepted by \texttt{verify}.
 \end{figure}
 
 \subsection{File copy time and the Nagle effect}
+\label{sec:nagle}
 
 Files of 1\,KB to 65\,000\,KB were copied five times in each direction with
 \texttt{rcp}, and the median time it reported is shown (connection, handshake
@@ -777,6 +789,12 @@ received A's MAC address, which the server had only learned from A's request.
   $64\times$ faster. Large files are limited by copying, about 200\,MB/s either
   way.
 
+\item \textbf{Encryption costs size only in the framing.} Typing
+  \texttt{whoami} sent 8 readable bytes over Telnet
+  (\texttt{whoami\textbackslash r\textbackslash n}) and a 16-byte frame over
+  rsh: the stream cipher adds no bytes at all, and the 9 extra bytes are the
+  frame length, the message tag and the field length.
+
 \item \textbf{One message per file sets a size limit.} A 65\,000\,KB file was
   copied, but a 64\,MiB file fails with \texttt{packet too large}, because the
   whole file must fit in one frame.
@@ -794,7 +812,7 @@ received A's MAC address, which the server had only learned from A's request.
 
 \begin{itemize}
 \item Write the length and the body of a frame in one \texttt{write} call, or
-  set \texttt{TCP\_NODELAY}. Section~5.4 shows this removes 40\,ms stalls and
+  set \texttt{TCP\_NODELAY}. Section~\ref{sec:nagle} shows this removes 40\,ms stalls and
   makes a login about $64\times$ faster.
 \item Let the server send a random nonce with its host key and have the client
   sign it as well, so that a recorded login cannot be replayed.
@@ -817,8 +835,11 @@ received A's MAC address, which the server had only learned from A's request.
 % ---------------------------------------------------------------- 8
 \section{Comments}
 
-Building both protocols from the standard library alone made every layer
-visible: the bytes of an ARP packet, the length prefix of a frame, the RSA
+Starting with Telnet and then securing it made the purpose of each part of
+SSH concrete: the recorded Telnet session showed the password on the wire, and
+the same kind of session over rsh showed only noise, with each piece of the
+cryptography accounting for one of the missing guarantees. Building both
+protocols from the standard library alone made every layer visible: the bytes of an ARP packet, the length prefix of a frame, the RSA
 arithmetic and the order of the handshake messages. The tests showed that the
 design is right in structure, since host keys, authorized keys and encryption
 all behave as intended, but also why real protocols carry more than this: a key

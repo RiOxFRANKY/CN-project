@@ -1,0 +1,75 @@
+% ---------------------------------------------------------------- rsh as encrypted Telnet
+\subsection{rsh: Telnet made secure}
+\label{sec:rshdesign}
+
+rsh does the job Telnet did, typing into a shell on another machine and seeing
+its output, but it changes how the bytes are carried. Telnet mixes its control
+commands into the data with \texttt{IAC}. rsh instead wraps everything in typed
+messages inside length-prefixed frames, and encrypts the messages.
+Table~\ref{tab:telnetvsrsh} compares the two point by point.
+
+\begin{table}[H]
+\centering
+\footnotesize
+\begin{tabularx}{\textwidth}{@{}l X X@{}}
+\toprule
+Concern & Telnet (RFC 854, our first version) & rsh \\
+\midrule
+Transport & TCP, port 23 (ours 2323) & TCP, port 2222 \\
+Framing & none: one byte stream & 4-byte length + 1-byte message tag + fields \\
+Control & \texttt{IAC} commands in the data, data 255 doubled & message types: \texttt{Shell}, \texttt{Eof}, \texttt{Exit}, \texttt{Disconnect}, \ldots \\
+Feature agreement & option negotiation (\texttt{WILL}/\texttt{WONT}/\texttt{DO}/\texttt{DONT}) & none needed: one fixed protocol version \\
+Server identity & none & RSA host key, checked against \texttt{known\_hosts} \\
+Client login & name and password typed in clear (ours: no login) & signature with the client's private key, checked against \texttt{authorized\_keys} \\
+Confidentiality & none & RSA key transport, then a stream cipher per direction \\
+Integrity & none & none (Section~\ref{sec:cryptolimits}) \\
+Remote side & NVT; ours a built-in command interpreter & a real shell process: \texttt{sh -i} or \texttt{cmd.exe} \\
+Line endings & NVT \texttt{CR LF} & bytes passed through unchanged \\
+End of session & TCP close & \texttt{Exit(code)}, then \texttt{Disconnect}; the client exits with the shell's code \\
+File transfer & not part of Telnet (needs FTP) & \texttt{Upload} / \texttt{Download}, used by \texttt{rcp} \\
+\bottomrule
+\end{tabularx}
+\caption{The first Telnet version compared with rsh.}
+\label{tab:telnetvsrsh}
+\end{table}
+
+Figure~\ref{fig:layers} shows the two protocol stacks. rsh adds two layers
+between TCP and the terminal data: framing, which keeps message boundaries, and
+the cipher, which hides their content. Because the cipher sits under the message
+layer, the rest of the program sends and receives plain \texttt{Message}
+values and never handles encrypted bytes itself.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  font=\small,
+  lay/.style={draw, minimum width=5.2cm, minimum height=0.72cm, align=center},
+  new/.style={lay, fill=blue!8},
+]
+  \node[font=\bfseries] at (0,0.75) {Telnet};
+  \node[lay] (t3) at (0,0) {terminal data and \texttt{IAC} commands};
+  \node[lay, below=0pt of t3] (t2) {NVT byte stream (\texttt{CR LF})};
+  \node[lay, below=0pt of t2] (t1) {TCP};
+  \node[lay, below=0pt of t1] (t0) {IP};
+
+  \node[font=\bfseries] at (7,0.75) {rsh};
+  \node[lay] (r4) at (7,0) {\texttt{Shell}/\texttt{Data}/\texttt{Exit}/\ldots\ messages};
+  \node[new, below=0pt of r4] (r3) {stream cipher (after the handshake)};
+  \node[new, below=0pt of r3] (r2) {frames: 4-byte length + body};
+  \node[lay, below=0pt of r2] (r1) {TCP};
+  \node[lay, below=0pt of r1] (r0) {IP};
+  \draw[dashed, gray] (t1.north east) -- (r1.north west);
+  \draw[dashed, gray] (t1.south east) -- (r1.south west);
+\end{tikzpicture}
+\caption{Protocol layers. The shaded layers are what rsh adds to a Telnet-style session.}
+\label{fig:layers}
+\end{figure}
+
+A connection goes through three phases. The \emph{handshake}
+(Figure~\ref{fig:handshake}) authenticates the server, sets up the session key
+and authenticates the client. In the \emph{request} phase the client sends one
+of \texttt{Shell}, \texttt{Upload}, \texttt{Download} or \texttt{Disconnect};
+files can be moved several times on one connection. A \texttt{Shell} request
+starts the \emph{interactive} phase, which lasts until the shell exits or
+either side hangs up. Section~\ref{sec:rshsession} follows a real session
+through all three phases, packet by packet.

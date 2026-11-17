@@ -1,0 +1,188 @@
+% ---------------------------------------------------------------- Telnet
+\section{Telnet}
+\label{sec:telnet}
+
+The remote shell in this project started as a Telnet server and client
+(commit \texttt{4b08310}). Telnet showed how a remote terminal works, and also
+why it cannot be used on a real network: everything it sends, passwords
+included, can be read by anyone on the path. The rsh programs keep Telnet's
+idea of a terminal session over TCP and add the missing security. This section
+describes Telnet and the first implementation; Section~\ref{sec:rshdesign}
+describes how it became rsh.
+
+\subsection{The protocol}
+
+Telnet is defined in RFC~854 (1983). A client opens a TCP connection to port
+23 and both sides then exchange a stream of bytes in the format of the
+\emph{Network Virtual Terminal} (NVT): 7-bit ASCII text, with every line ending
+in \texttt{CR LF}. There are no packets or headers of Telnet's own; the
+protocol lives entirely in the byte stream.
+
+Control information is mixed into the data with an escape byte,
+\texttt{IAC} (``interpret as command'', 255). The byte after \texttt{IAC} is a
+command. A data byte that really is 255 is sent as \texttt{IAC IAC}.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}r p{3.4cm} X@{}}
+\toprule
+Code & Name & Meaning \\
+\midrule
+240 & \texttt{SE}   & end of a subnegotiation \\
+241 & \texttt{NOP}  & no operation \\
+242--249 & \texttt{DM BRK IP AO}\newline \texttt{AYT EC EL GA} & data mark, break, interrupt process, abort output, are you there, erase character, erase line, go ahead \\
+250 & \texttt{SB}   & start of a subnegotiation: \texttt{IAC SB} \textit{option} \ldots\ \texttt{IAC SE} \\
+251 & \texttt{WILL} & sender wants to enable an option on its side \\
+252 & \texttt{WONT} & sender refuses to enable, or disables, an option on its side \\
+253 & \texttt{DO}   & sender asks the other side to enable an option \\
+254 & \texttt{DONT} & sender asks the other side not to use, or to stop, an option \\
+255 & \texttt{IAC}  & interpret the next byte as a command; \texttt{IAC IAC} is a data byte 255 \\
+\bottomrule
+\end{tabularx}
+\caption{Telnet commands (RFC 854).}
+\end{table}
+
+\textbf{Option negotiation} (RFC~855) lets the two ends agree on extra
+features. Each option is a number, and a request takes three bytes, for
+example \texttt{IAC DO 1} (``please echo''). The answer is either the
+agreeing form (\texttt{WILL 1}) or the refusing form (\texttt{WONT 1}), and a
+side must not answer a request for a state it is already in, which prevents
+endless loops. Either side may always refuse, so a minimal implementation that
+refuses everything still works with any client: both ends then fall back to
+the plain NVT.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}r l l l@{}}
+\toprule
+Number & Option & RFC & Purpose \\
+\midrule
+0  & Binary transmission & 856  & send 8-bit data instead of NVT ASCII \\
+1  & Echo                & 857  & the side that \texttt{WILL ECHO} echoes the characters it receives \\
+3  & Suppress go-ahead   & 858  & full-duplex use, no \texttt{GA} after each turn \\
+24 & Terminal type       & 1091 & the client names its terminal, e.g.\ \texttt{xterm} \\
+31 & Window size (NAWS)  & 1073 & the client reports columns and rows \\
+34 & Linemode            & 1184 & edit lines locally and send whole lines \\
+\bottomrule
+\end{tabular}
+\caption{Common Telnet options.}
+\end{table}
+
+Telnet has no login protocol of its own. The server simply runs a
+\texttt{login} program, which prints \texttt{login:} and \texttt{Password:} and
+reads the answers from the same byte stream as everything else. Nothing is
+encrypted, the server proves nothing about who it is, and the client proves
+who it is only by typing a password across the network. For these reasons
+Telnet was replaced by SSH, first released in 1995 and standardised in
+RFC~4251--4254 (2006).
+
+\subsection{Our Telnet implementation}
+
+The first version (\texttt{telnet/}, about 260 lines of Rust, standard library only) had a
+multi-threaded server on TCP port 2323 and an interactive client. Instead of a
+real shell the server ran a small command interpreter with \texttt{help},
+\texttt{echo <text>}, \texttt{time} and \texttt{quit}.
+
+Both sides passed every received chunk through the same \texttt{Parser}, a
+state machine that separates data bytes from \texttt{IAC} commands
+(Figure~\ref{fig:telnetfsm}). It refuses every option, answering \texttt{DO}
+with \texttt{WONT} and \texttt{WILL} with \texttt{DONT}, and skips
+subnegotiations. Outgoing data goes through \texttt{escape}, which doubles each
+255 byte.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  >={Stealth[length=2mm]}, node distance=2.1cm and 2.9cm, font=\small,
+  st/.style={draw, rounded corners, minimum width=1.9cm, minimum height=0.75cm, fill=gray!8},
+  lab/.style={font=\footnotesize, fill=white, inner sep=1.5pt},
+]
+  \node[st] (data) {\texttt{Data}};
+  \node[st, right=of data] (iac) {\texttt{Iac}};
+  \node[st, right=of iac] (opt) {\texttt{Option(cmd)}};
+  \node[st, below=1.9cm of iac] (sub) {\texttt{Sub}};
+  \node[st, right=of sub] (subiac) {\texttt{SubIac}};
+
+  \draw[->] (data) to[loop left] node[lab, left]{other: emit byte} (data);
+  \draw[->] (data) to[bend left=18] node[lab, above]{255} (iac);
+  \draw[->] (iac) to[bend left=18] node[lab, below]{255: emit 255; other: ignore} (data);
+  \draw[->] (iac) -- node[lab, above]{\texttt{DO}, \texttt{DONT}, \texttt{WILL}, \texttt{WONT}} (opt);
+  \draw[->] (opt) to[out=110, in=60, looseness=0.55] node[lab, above]{option byte: reply \texttt{WONT}/\texttt{DONT}} (data);
+  \draw[->] (iac) -- node[lab, right]{\texttt{SB}} (sub);
+  \draw[->] (sub) to[loop below] node[lab, below]{other} (sub);
+  \draw[->] (sub) to[bend left=15] node[lab, above]{255} (subiac);
+  \draw[->] (subiac) to[bend left=15] node[lab, below]{other} (sub);
+  \draw[->] (subiac) to[out=200, in=-80, looseness=1.1] node[lab, below left]{\texttt{SE}} (data);
+\end{tikzpicture}
+\caption{The Telnet input parser of the first version (\texttt{protocol.rs}).}
+\label{fig:telnetfsm}
+\end{figure}
+
+\Needspace{16\baselineskip}
+\begin{lstlisting}[caption={Option refusal and escaping in the Telnet parser (\texttt{protocol.rs}).}]
+State::Iac => match b {
+    IAC => { data.push(IAC); State::Data }           // IAC IAC is a data byte 255
+    DO | DONT | WILL | WONT => State::Option(b),
+    SB => State::Sub,
+    _ => State::Data,                                  // NOP, GA, ...: ignored
+},
+State::Option(cmd) => {
+    match cmd {
+        DO => replies.extend([IAC, WONT, b]),          // "I will not"
+        WILL => replies.extend([IAC, DONT, b]),        // "please do not"
+        _ => {}                                        // WONT, DONT need no answer
+    }
+    State::Data
+}
+\end{lstlisting}
+
+\subsection{A Telnet session on the wire}
+\label{sec:telnetwire}
+
+To show what Telnet exposes, the first version was rebuilt from the repository
+history and a session was recorded through a TCP relay that copies every byte
+(\texttt{report/tools/relay.py}). The client first sent three option requests
+of the kind a Telnet client sends when it connects, then typed four lines. This is the complete
+traffic, in order:
+
+\input{gen/telnet_capture.tex}
+
+The server refused all three options, exactly as in
+Figure~\ref{fig:telnetfsm}. Everything else is readable as it is. The line
+that carried the ``password'' looks like this on the wire:
+
+\begin{table}[H]
+\centering
+\input{gen/telnet_password.tex}
+\caption{The bytes of \texttt{echo my-password-123} as captured: each byte is the ASCII code of the character typed.}
+\label{tab:telnetpw}
+\end{table}
+
+Anyone who can see the packets (another host on the same Wi-Fi, a router, the
+ISP) reads the password directly. They can also change the bytes or inject new
+commands, and the client has no way to tell whether it is talking to the real
+server at all.
+
+\subsection{What an encrypted Telnet needs}
+
+Turning Telnet into a safe remote shell needs four things that Telnet does not
+have. Each became part of rsh:
+
+\begin{enumerate}
+\item \textbf{Server authentication}: the client must know it reached the right
+  server. rsh gives each server an RSA host key and keeps a
+  \texttt{known\_hosts} list.
+\item \textbf{A shared secret}: both ends need a key that the observer does not
+  have. The client makes a random session key and sends it encrypted with the
+  host's public key.
+\item \textbf{Confidentiality}: every byte after the key exchange is encrypted
+  with a stream cipher keyed by the session key.
+\item \textbf{Client authentication without a password on the wire}: the client
+  signs the session key with its private key; the server checks the signature
+  against \texttt{authorized\_keys}.
+\end{enumerate}
+
+\noindent A fifth requirement, \emph{integrity} (detecting changed bytes), is
+not met by this version; Section~\ref{sec:cryptolimits} shows what that allows.

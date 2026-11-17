@@ -1,0 +1,127 @@
+% ---------------------------------------------------------------- remote shell in detail
+\subsection{The encrypted remote shell}
+\label{sec:shellimpl}
+
+\textbf{Server.} \texttt{server::run} loads (or creates) the host key, listens
+on TCP port 2222 and starts one thread per accepted connection. That thread runs
+the handshake and then the request loop of \texttt{session.rs}: \texttt{Upload}
+and \texttt{Download} are answered and the loop continues, \texttt{Disconnect}
+ends it, and \texttt{Shell} hands the connection to \texttt{shell::run}. The
+shell starts in the folder where the server was started, with all three
+standard streams connected to pipes. The connection is then split into its
+\texttt{Sender} and \texttt{Receiver} halves (Section~\ref{sec:framing}), so
+that reading and writing can happen in different threads, each half with its
+own cipher.
+
+\textbf{Client.} \texttt{rsh connect} loads \texttt{id\_rsh}, connects, runs the
+handshake, sends \texttt{Shell} and waits for \texttt{Success}. It then also
+splits the connection: one thread reads the local keyboard and sends
+\texttt{Data}, while the main thread receives messages and writes \texttt{Data}
+to the screen until \texttt{Exit} arrives. Figure~\ref{fig:threads} shows all
+the threads of one session.
+
+\begin{figure}[H]
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  font=\footnotesize, >={Stealth[length=2mm]},
+  th/.style={draw, rounded corners, fill=blue!7, align=center, minimum width=2.7cm, minimum height=0.8cm},
+  io/.style={draw, align=center, minimum width=1.5cm, minimum height=0.7cm, fill=gray!10},
+  lock/.style={draw, dashed, align=center, minimum width=1.4cm, minimum height=0.6cm},
+]
+  % client
+  \node[font=\bfseries\small] at (0.6,2.1) {client};
+  \node[io] (kbd) at (-1.4,1.2) {keyboard};
+  \node[io] (scr) at (-1.4,-1.2) {screen};
+  \node[th] (fwd) at (1.4,1.2) {stdin forwarder\\(thread)};
+  \node[th] (cmain) at (1.4,-1.2) {main thread\\(receiver)};
+  \draw[->] (kbd) -- (fwd);
+  \draw[->] (cmain) -- (scr);
+
+  % wire
+  \draw[->, very thick, blue!60!black] (2.75,1.2) -- node[above, align=center]{\texttt{Data}, \texttt{Eof}, \texttt{Disconnect}\\[-1pt] c2s keystream} (6.55,1.2);
+  \draw[<-, very thick, blue!60!black] (2.75,-1.2) -- node[below, align=center]{s2c keystream\\[-1pt] \texttt{Data}, \texttt{Exit}} (6.55,-1.2);
+  \node[gray, align=center] at (4.65,0) {one TCP connection\\(encrypted frames)};
+
+  % server
+  \node[font=\bfseries\small] at (8.7,2.1) {server};
+  \node[th] (sess) at (7.9,1.2) {session thread\\(receiver)};
+  \node[lock] (snd) at (7.9,-1.2) {\texttt{Sender}\\ (mutex)};
+  \node[th] (pout) at (10.6,-0.4) {stdout pump\\+ echo filter};
+  \node[th] (perr) at (10.6,-1.55) {stderr pump};
+  \node[th] (watch) at (10.6,-2.7) {exit watcher};
+  \node[io, minimum height=4.5cm, minimum width=1.3cm] (sh) at (13.6,-0.6) {shell\\process};
+  \draw[->] (sess) -- node[above]{stdin pipe} (sh.north west |- sess);
+  \draw[<-] (pout) -- node[above, pos=0.55]{stdout} (pout -| sh.west);
+  \draw[<-] (perr) -- node[above, pos=0.55]{stderr} (perr -| sh.west);
+  \draw[->] (pout.west) -- (snd.east);
+  \draw[->] (perr.west) -- (snd.east);
+  \draw[->] (watch.west) -| (snd.south);
+  \draw[->, dotted] (watch.east) -| node[pos=0.25, below]{\texttt{wait()}} (sh.south);
+  \draw[->] (snd.west) -- (6.55,-1.2);
+  \draw[<-] (sess.west) -- (6.55,1.2);
+\end{tikzpicture}}
+\caption{Threads of one interactive session. The three server threads that send share one \texttt{Sender} behind a mutex, so their messages never interleave inside a frame and the keystream positions stay in order.}
+\label{fig:threads}
+\end{figure}
+
+The mutex around the \texttt{Sender} matters for the encryption: the cipher
+state moves forward with every byte, so two threads must never encrypt at the
+same time. Each frame is encrypted and written while the lock is held, which
+makes the order of frames on the wire the same as the order of keystream use.
+
+\Needspace{18\baselineskip}
+\begin{lstlisting}[caption={The server's input loop (\texttt{server/shell.rs}).}]
+let result = loop {
+    match receiver.recv() {                         // decrypt with the c2s keystream
+        Ok(Message::Data(data)) => {
+            if let Some(input) = stdin.as_mut() {
+                echo.lock().unwrap().expect(&data); // Windows: note the echo
+                if input.write_all(&data).and_then(|_| input.flush()).is_err() {
+                    stdin = None;                   // shell closed its input
+                }
+            }
+        }
+        Ok(Message::Eof) => stdin = None,           // dropping the pipe sends EOF
+        Ok(Message::Disconnect) => break Ok(()),
+        Ok(_) => break Err(invalid("unexpected message during shell")),
+        Err(e) => break Err(e),                     // connection lost
+    }
+};
+drop(stdin);
+let _ = child.lock().unwrap().kill();               // never leave a shell behind
+\end{lstlisting}
+
+\textbf{How a session ends.} Every way out ends with the shell gone and the
+client told why:
+
+\begin{table}[H]
+\centering
+\footnotesize
+\begin{tabularx}{\textwidth}{@{}l X@{}}
+\toprule
+Event & What happens \\
+\midrule
+User types \texttt{exit 3} & the shell exits; its pipes close, both pumps finish, the watcher collects code 3 and sends \texttt{Exit(3)}; the client sends \texttt{Disconnect} and exits with code 3 \\
+End of input on the client (Ctrl+D, end of a pipe) & the forwarder sends \texttt{Eof}; the server drops the shell's stdin pipe; \texttt{sh} sees end of input and exits as above \\
+Client killed or network lost & the server's \texttt{recv} fails, the loop ends and the server kills the shell \\
+Shell killed on the server & it has no exit code; the watcher sends \texttt{Exit(-1)} \\
+Shell cannot be started & the server sends \texttt{Failure("cannot start shell: \ldots")} instead of \texttt{Success} \\
+\bottomrule
+\end{tabularx}
+\caption{Ending an interactive session.}
+\end{table}
+
+\textbf{Echo filter.} With no terminal attached, \texttt{cmd.exe} echoes every
+command line it reads to its output, so the user would see each command twice.
+On Windows the server therefore records each complete input line, for example
+\texttt{dir\textbackslash r\textbackslash n}, and the stdout pump removes
+exactly that byte sequence when it arrives. As soon as the output differs from
+what was expected, the held bytes are released, so real output is never lost.
+On other systems the filter does nothing, because \texttt{sh} does not echo.
+
+\textbf{File copy.} \texttt{rcp} uses the same connection and handshake but
+sends one \texttt{Upload} (path, file name, contents) or \texttt{Download}
+(path) and waits for \texttt{Success}, \texttt{File} or \texttt{Failure},
+then sends \texttt{Disconnect}. The whole file travels in one encrypted
+message, so its contents are protected exactly like the shell traffic.
